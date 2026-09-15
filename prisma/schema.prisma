@@ -1,0 +1,3356 @@
+// Phase 1 (bootstrap): PostgreSQL extensions only.
+// Phase 2A (identity foundation): core User identity, RBAC, audit log, and outbox.
+// Further domain models are introduced incrementally, phase by phase, per project rules.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  // postgis is intentionally not enabled: no column in this schema uses a
+  // geography/geometry type yet (all location fields are plain Float
+  // latitude/longitude columns). Add it back — with an actual geography
+  // column — when a real PostGIS-backed feature needs it; declaring it
+  // unused requires every environment to have the postgis OS package
+  // installed just to run `prisma migrate deploy`, which isn't worth paying
+  // for a capability nothing exercises today.
+  extensions = [pgcrypto, citext]
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+/// Account lifecycle status. Deliberately separate from role assignment and
+/// from authentication-provider concerns (see UserIdentity).
+enum AccountStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+  DELETED
+
+  @@map("account_status")
+}
+
+/// Coarse category of an authentication identity. `providerName` carries the
+/// exact source (e.g. "email", "phone", "google") so new OAuth providers can
+/// be added without a schema migration.
+enum IdentityProviderType {
+  EMAIL
+  PHONE
+  OAUTH
+
+  @@map("identity_provider_type")
+}
+
+/// Core human account. Intentionally minimal: profile data belongs to the
+/// future Customer/Driver domains, and authentication credentials belong to
+/// UserIdentity. A single User can hold multiple roles and multiple
+/// authentication identities.
+model User {
+  id            String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountStatus AccountStatus @default(PENDING) @map("account_status")
+
+  /// Locale preference for the user interface ('en', 'hi', 'gu'). Default: 'en'
+  preferredLocale String @default("en") @map("preferred_locale")
+
+  // Soft delete: the row is never physically removed. Financial, booking,
+  // and audit references must survive account deletion.
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+  deletedBy String?   @map("deleted_by") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  identities UserIdentity[]
+  roles      UserRole[]     @relation("UserRoleUser")
+
+  rolesAssigned UserRole[] @relation("UserRoleAssignedBy")
+  rolesRevoked  UserRole[] @relation("UserRoleRevokedBy")
+
+  credentials             UserCredential?
+  sessions                UserSession[]
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]
+  customerProfile         CustomerProfile?
+  savedLocations          SavedLocation[]
+  customerPreference      CustomerPreference?
+  customerCurrentLocation CustomerCurrentLocation?
+  driverProfile           DriverProfile?
+  customerBookings        Booking[]                @relation("CustomerBookings")
+  payments                Payment[]
+  notifications           Notification[]
+  pushSubscriptions       PushSubscription[]
+  notificationPreferences NotificationPreference[]
+  reporterSafetyIncidents SafetyIncident[]         @relation("ReporterSafetyIncidents")
+  customerSafetyIncidents SafetyIncident[]         @relation("CustomerSafetyIncidents")
+  assignedSafetyIncidents SafetyIncident[]         @relation("AssignedSafetyIncidents")
+  customerReliabilityIncidents TripReliabilityIncident[] @relation("CustomerReliabilityIncidents")
+  safetyTimelineEntries   SafetyIncidentTimeline[]
+  userRaisedDisputes      Dispute[]                @relation("UserRaisedDisputes")
+  assignedDisputes        Dispute[]                @relation("AssignedDisputes")
+  disputeLogs             DisputeLog[]
+  referralCode            UserReferralCode?
+  givenReferrals          Referral[]               @relation("ReferrerUser")
+  receivedReferral        Referral?                @relation("ReferredUser")
+  customerReviews         Review[]                 @relation("CustomerReviews")
+  promotionUsages         PromotionUsage[]
+  customerSupportTickets  SupportTicket[]          @relation("CustomerSupportTickets")
+  assignedSupportTickets  SupportTicket[]          @relation("AssignedSupportTickets")
+  supportMessages         SupportMessage[]
+  initiatedCalls          CallSession[]            @relation("InitiatedCalls")
+  customerCalls           CallSession[]            @relation("CustomerCalls")
+  customerTaxInvoices     TaxInvoice[]             @relation("CustomerTaxInvoices")
+  favoriteDrivers         CustomerFavoriteDriver[] @relation("CustomerFavoriteDrivers")
+  customerLoyaltyAccount  CustomerLoyaltyAccount?  @relation("CustomerLoyaltyAccount")
+  adminLoyaltyAdjustments LoyaltyPointTransaction[] @relation("AdminLoyaltyAdjustments")
+  scheduledRides          ScheduledRide[]          @relation("CustomerScheduledRides")
+  organizationMemberships    OrganizationMember[]
+  organizationInvitationsSent OrganizationInvitation[]     @relation("InvitedByUsers")
+  bookedForBookings          Booking[]                    @relation("BookedForUserBookings")
+  approvalRequestsSubmitted  CorporateApprovalRequest[]  @relation("RequesterUsers")
+  approvalRequestsReviewed   CorporateApprovalRequest[]  @relation("ApproverUsers")
+  recommendationActions      MarketplaceRecommendationAction[] @relation("AdminRecommendationActions")
+  aiConversations            AIConversation[]
+  aiAuditLogs                AIAuditLog[]
+  tripIntelligenceEvents     TripIntelligenceEvent[]
+
+  @@index([accountStatus])
+  @@index([createdAt])
+  @@map("users")
+}
+
+/// One authentication identity a User can sign in with. A User has one row
+/// per identity (email, phone, or an OAuth provider); the same person is
+/// never duplicated into multiple Users just because they add another
+/// supported sign-in method.
+model UserIdentity {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  providerType    IdentityProviderType @map("provider_type")
+  /// Exact source: "email", "phone", "google", etc. Always populated (never
+  /// null) so the (providerName, providerSubject) unique constraint below
+  /// works correctly — a nullable discriminator would let Postgres treat
+  /// every NULL as distinct and silently allow duplicate email/phone rows.
+  providerName    String               @map("provider_name")
+  /// Canonical identifier within that provider's namespace: normalized
+  /// lowercase email, normalized E.164 phone, or the OAuth `sub` claim.
+  providerSubject String               @map("provider_subject")
+
+  /// Populated for EMAIL identities (canonical) and optionally for OAuth
+  /// identities that supplied a verified email, so a Google sign-in that
+  /// matches an existing email identity can be detected instead of silently
+  /// creating a duplicate account. citext makes lookups case-insensitive at
+  /// the database level (defense in depth alongside app-level normalization).
+  email       String? @db.Citext
+  /// Populated for PHONE identities, stored pre-normalized to E.164.
+  phoneNumber String? @map("phone_number")
+
+  verifiedAt DateTime? @map("verified_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  emailVerificationTokens EmailVerificationToken[]
+
+  @@unique([providerName, providerSubject], name: "provider_identity_unique")
+  @@unique([email])
+  @@unique([phoneNumber])
+  @@map("user_identities")
+}
+
+// ---------------------------------------------------------------------------
+// RBAC
+// ---------------------------------------------------------------------------
+
+/// A system role. Stored as data (not a Prisma enum) so new roles can be
+/// introduced by an admin/seed without a schema migration.
+model Role {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code        String  @unique
+  name        String
+  description String?
+  /// System roles (CUSTOMER/DRIVER/ADMINISTRATOR) are seeded and must not be
+  /// deletable through future admin tooling.
+  isSystem    Boolean @default(false) @map("is_system")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  rolePermissions RolePermission[]
+  userRoles       UserRole[]
+
+  @@map("roles")
+}
+
+/// A single server-enforceable permission, named `domain.resource.action`.
+model Permission {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code        String  @unique
+  description String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+/// Role -> Permission grant. A pure join table with no independent identity,
+/// so it uses a composite primary key instead of a surrogate UUID.
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+/// User -> Role assignment. Unlike RolePermission this carries its own
+/// lifecycle (who assigned/revoked it and when), so it gets a surrogate id.
+/// A revoked assignment is kept (not deleted) and reused on re-assignment —
+/// `revokedAt IS NULL` is the single source of truth for "currently active".
+/// Full historical detail (assigned, revoked, re-assigned...) lives in
+/// AuditLog, which is append-only; this table only reflects current state.
+model UserRole {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  roleId String @map("role_id") @db.Uuid
+
+  user User @relation("UserRoleUser", fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  assignedBy     String?   @map("assigned_by") @db.Uuid
+  assignedByUser User?     @relation("UserRoleAssignedBy", fields: [assignedBy], references: [id], onDelete: SetNull)
+  assignedAt     DateTime  @default(now()) @map("assigned_at") @db.Timestamptz(6)
+  revokedBy      String?   @map("revoked_by") @db.Uuid
+  revokedByUser  User?     @relation("UserRoleRevokedBy", fields: [revokedBy], references: [id], onDelete: SetNull)
+  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-cutting: audit + outbox
+// ---------------------------------------------------------------------------
+
+/// Append-only record of an important administrative or business action.
+/// Never updated or deleted; there is deliberately no `updatedAt`/soft-delete.
+model AuditLog {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Null means system-initiated (no human/service actor), not "unknown".
+  actorUserId String? @map("actor_user_id") @db.Uuid
+
+  action     String
+  entityType String @map("entity_type")
+  /// Stored as text (not a foreign key) so one audit table can reference any
+  /// entity type across the whole application.
+  entityId   String @map("entity_id")
+
+  beforeState     Json? @map("before_state") @db.JsonB
+  afterState      Json? @map("after_state") @db.JsonB
+  requestMetadata Json? @map("request_metadata") @db.JsonB
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([entityType, entityId])
+  @@index([actorUserId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+enum OutboxEventStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+
+  @@map("outbox_event_status")
+}
+
+/// Reliable-event foundation: written in the same transaction as the domain
+/// change it describes, consumed asynchronously by outbox worker.
+model OutboxEvent {
+  id            String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  eventType     String            @map("event_type")
+  aggregateType String            @map("aggregate_type")
+  aggregateId   String            @map("aggregate_id")
+  payload       Json              @db.JsonB
+  status        OutboxEventStatus @default(PENDING)
+  attempts      Int               @default(0)
+  lastError     String?           @map("last_error")
+
+  availableAt   DateTime  @default(now()) @map("available_at") @db.Timestamptz(6)
+  lastAttemptAt DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  lockedAt      DateTime? @map("locked_at") @db.Timestamptz(6)
+  lockedBy      String?   @map("locked_by")
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
+
+  @@index([status, availableAt, createdAt])
+  @@index([status, createdAt])
+  @@map("outbox_events")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Credentials, Sessions, Tokens & OTP
+// ---------------------------------------------------------------------------
+
+/// Password credentials for password-authenticated users. Hashed using
+/// Argon2id / PBKDF2 with unique per-user salt. Passwords are never stored
+/// or logged in plaintext.
+model UserCredential {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId          String   @unique @map("user_id") @db.Uuid
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passwordHash    String   @map("password_hash")
+  algorithm       String   @default("argon2id")
+  passwordVersion Int      @default(1) @map("password_version")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("user_credentials")
+}
+
+/// Server-authoritative user sessions. Raw session tokens are never stored
+/// in plaintext; only the SHA-256 hash is persisted.
+model UserSession {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionTokenHash String    @unique @map("session_token_hash")
+  ipAddress        String?   @map("ip_address")
+  userAgent        String?   @map("user_agent")
+  expiresAt        DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz(6)
+  lastUsedAt       DateTime  @default(now()) @map("last_used_at") @db.Timestamptz(6)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([userId, revokedAt, expiresAt])
+  @@map("user_sessions")
+}
+
+/// Single-use email verification tokens.
+model EmailVerificationToken {
+  id         String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String       @map("user_id") @db.Uuid
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  identityId String       @map("identity_id") @db.Uuid
+  identity   UserIdentity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+  tokenHash  String       @unique @map("token_hash")
+  expiresAt  DateTime     @map("expires_at") @db.Timestamptz(6)
+  usedAt     DateTime?    @map("used_at") @db.Timestamptz(6)
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([tokenHash])
+  @@map("email_verification_tokens")
+}
+
+/// Single-use password reset tokens.
+model PasswordResetToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([tokenHash])
+  @@map("password_reset_tokens")
+}
+
+/// OTP verification challenges for phone authentication.
+model OtpChallenge {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phoneNumber String    @map("phone_number")
+  otpHash     String    @map("otp_hash")
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5) @map("max_attempts")
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  verifiedAt  DateTime? @map("verified_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([phoneNumber, createdAt])
+  @@map("otp_challenges")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: System Configuration, Customer Profile, Saved Locations, Preferences
+// ---------------------------------------------------------------------------
+
+enum ConfigValueType {
+  STRING
+  INTEGER
+  DECIMAL
+  BOOLEAN
+  JSON
+
+  @@map("config_value_type")
+}
+
+enum ThemePreference {
+  SYSTEM
+  LIGHT
+  DARK
+
+  @@map("theme_preference")
+}
+
+/// Centralized database-backed system configuration parameters.
+model SystemConfiguration {
+  id          String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key         String          @unique
+  value       String
+  valueType   ConfigValueType @default(STRING) @map("value_type")
+  description String?
+  category    String          @default("system")
+  isPublic    Boolean         @default(false) @map("is_public")
+  updatedBy   String?         @map("updated_by") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([category])
+  @@map("system_configurations")
+}
+
+/// Customer profile data linked 1-to-1 with core User account.
+model CustomerProfile {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId            String    @unique @map("user_id") @db.Uuid
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstName         String?   @map("first_name")
+  lastName          String?   @map("last_name")
+  displayName       String?   @map("display_name")
+  avatarUrl         String?   @map("avatar_url")
+  dateOfBirth       DateTime? @map("date_of_birth") @db.Timestamptz(6)
+  defaultLocationId String?   @map("default_location_id") @db.Uuid
+
+  customerRidePinHash      String?   @map("customer_ride_pin_hash")
+  customerRidePinCreatedAt DateTime? @map("customer_ride_pin_created_at") @db.Timestamptz(6)
+  customerRidePinUpdatedAt DateTime? @map("customer_ride_pin_updated_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("customer_profiles")
+}
+
+/// Persistent user-saved locations with spatial coordinates for routing & PostGIS.
+model SavedLocation {
+  id           String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String  @map("user_id") @db.Uuid
+  user         User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label        String // e.g. "Home", "Work", "Gym"
+  addressLine1 String  @map("address_line1")
+  addressLine2 String? @map("address_line2")
+  city         String
+  state        String
+  country      String  @default("India")
+  postalCode   String  @map("postal_code")
+  latitude     Float
+  longitude    Float
+  isDefault    Boolean @default(false) @map("is_default")
+
+  scheduledRides ScheduledRide[] @relation("SavedLocationScheduledRides")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([userId, isDefault])
+  @@map("saved_locations")
+}
+
+/// Extensible customer-specific preferences.
+model CustomerPreference {
+  id                        String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId                    String          @unique @map("user_id") @db.Uuid
+  user                      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  theme                     ThemePreference @default(SYSTEM)
+  language                  String          @default("en")
+  pushNotificationsEnabled  Boolean         @default(true) @map("push_notifications_enabled")
+  smsNotificationsEnabled   Boolean         @default(true) @map("sms_notifications_enabled")
+  emailNotificationsEnabled Boolean         @default(true) @map("email_notifications_enabled")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("customer_preferences")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Driver Domain, Onboarding, Documents, Verification, Approval & Availability
+// ---------------------------------------------------------------------------
+
+enum DriverOnboardingStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  SUBMITTED
+  UNDER_REVIEW
+  CHANGES_REQUESTED
+  COMPLETED
+
+  @@map("driver_onboarding_status")
+}
+
+enum DriverVerificationStatus {
+  NOT_VERIFIED
+  PENDING_VERIFICATION
+  VERIFIED
+  REJECTED
+
+  @@map("driver_verification_status")
+}
+
+enum DriverApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+
+  @@map("driver_approval_status")
+}
+
+enum DriverAvailabilityStatus {
+  OFFLINE
+  AVAILABLE
+  BUSY
+  UNAVAILABLE
+
+  @@map("driver_availability_status")
+}
+
+enum DriverDocumentType {
+  DRIVING_LICENSE
+  AADHAAR_CARD
+  PROFILE_PHOTO
+  BACKGROUND_VERIFICATION
+  POLICE_VERIFICATION
+  ADDRESS_PROOF
+
+  @@map("driver_document_type")
+}
+
+enum DriverDocumentStatus {
+  UPLOADED
+  PENDING_VERIFICATION
+  VERIFIED
+  REJECTED
+  EXPIRED
+  SUPERSEDED
+
+  @@map("driver_document_status")
+}
+
+/// Driver profile data linked 1-to-1 with core User account.
+model DriverProfile {
+  id                     String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId                 String                   @unique @map("user_id") @db.Uuid
+  user                   User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstName              String?                  @map("first_name")
+  lastName               String?                  @map("last_name")
+  displayName            String?                  @map("display_name")
+  profileImageUrl        String?                  @map("profile_image_url")
+  dateOfBirth            DateTime?                @map("date_of_birth") @db.Timestamptz(6)
+  gender                 String?
+  bio                    String?
+  drivingExperienceYears Int                      @default(0) @map("driving_experience_years")
+  primaryServiceArea     String?                  @map("primary_service_area")
+  onboardingStatus       DriverOnboardingStatus   @default(NOT_STARTED) @map("onboarding_status")
+  verificationStatus     DriverVerificationStatus @default(NOT_VERIFIED) @map("verification_status")
+  approvalStatus         DriverApprovalStatus     @default(PENDING) @map("approval_status")
+  availabilityStatus     DriverAvailabilityStatus @default(OFFLINE) @map("availability_status")
+  rejectionReason        String?                  @map("rejection_reason")
+  changesRequestedReason String?                  @map("changes_requested_reason")
+  approvedAt             DateTime?                @map("approved_at") @db.Timestamptz(6)
+  approvedBy             String?                  @map("approved_by") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  documents            DriverDocument[]
+  onboardingLogs       DriverOnboardingLog[]
+  currentLocation      DriverCurrentLocation?
+  locationHistory      DriverLocationHistory[]
+  assignedBookings     Booking[]                  @relation("DriverBookings")
+  preferredByBookings  Booking[]                  @relation("PreferredDriverBookings")
+  assignmentAttempts   BookingAssignmentAttempt[]
+  wallet               DriverWallet?
+  settlements          DriverSettlement[]
+  safetyIncidents      SafetyIncident[]           @relation("DriverSafetyIncidents")
+  reliabilityIncidents TripReliabilityIncident[]  @relation("DriverReliabilityIncidents")
+  reviews              Review[]                   @relation("DriverReviews")
+  ratingSummary        DriverRatingSummary?
+  driverCalls          CallSession[]              @relation("DriverCalls")
+  schedules            DriverSchedule[]
+  scheduleExceptions   DriverScheduleException[]
+  favoritedByCustomers CustomerFavoriteDriver[]   @relation("DriverFavoriteCustomers")
+  incentiveProgresses  DriverIncentiveProgress[]
+  goalPreference       DriverGoalPreference?
+  preferredScheduledRides ScheduledRide[]          @relation("PreferredDriverScheduledRides")
+  achievementProgresses DriverAchievementProgress[]
+  achievementUnlocks    DriverAchievementUnlock[]
+  streak                DriverStreak?
+
+  @@index([onboardingStatus])
+  @@index([verificationStatus])
+  @@index([approvalStatus])
+  @@index([availabilityStatus])
+  @@map("driver_profiles")
+}
+
+/// Driver document records for identity, license, and compliance verification.
+model DriverDocument {
+  id               String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId  String               @map("driver_profile_id") @db.Uuid
+  driverProfile    DriverProfile        @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  documentType     DriverDocumentType   @map("document_type")
+  documentNumber   String?              @map("document_number")
+  storageKey       String               @map("storage_key")
+  originalFileName String               @map("original_file_name")
+  contentType      String               @map("content_type")
+  fileSizeBytes    Int                  @map("file_size_bytes")
+  checksum         String?
+  status           DriverDocumentStatus @default(UPLOADED)
+  rejectionReason  String?              @map("rejection_reason")
+  verifiedAt       DateTime?            @map("verified_at") @db.Timestamptz(6)
+  verifiedBy       String?              @map("verified_by") @db.Uuid
+  expiresAt        DateTime?            @map("expires_at") @db.Timestamptz(6)
+  version          Int                  @default(1)
+  isCurrent        Boolean              @default(true) @map("is_current")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([driverProfileId, documentType])
+  @@index([status])
+  @@map("driver_documents")
+}
+
+/// Append-only audit history of driver onboarding and status transitions.
+model DriverOnboardingLog {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId String        @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  actorUserId     String?       @map("actor_user_id") @db.Uuid
+  fromStatus      String        @map("from_status")
+  toStatus        String        @map("to_status")
+  action          String
+  reason          String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([driverProfileId, createdAt])
+  @@map("driver_onboarding_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: Location Intelligence, Live Driver Location & Nearby Discovery
+// ---------------------------------------------------------------------------
+
+enum LocationSource {
+  BROWSER_GPS
+  MAP_SELECTION
+  SAVED_LOCATION
+  MOBILE_GPS
+
+  @@map("location_source")
+}
+
+/// Authoritative PostgreSQL + PostGIS driver last known location.
+model DriverCurrentLocation {
+  id              String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId String         @unique @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile  @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  latitude        Float
+  longitude       Float
+  accuracy        Float?
+  heading         Float?
+  speed           Float?
+  source          LocationSource @default(BROWSER_GPS)
+  capturedAt      DateTime       @map("captured_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([updatedAt])
+  @@map("driver_current_locations")
+}
+
+/// Sampled driver location telemetry history.
+model DriverLocationHistory {
+  id              String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId String         @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile  @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  latitude        Float
+  longitude       Float
+  accuracy        Float?
+  heading         Float?
+  speed           Float?
+  source          LocationSource @default(BROWSER_GPS)
+  capturedAt      DateTime       @map("captured_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([driverProfileId, capturedAt])
+  @@map("driver_location_histories")
+}
+
+/// Transient customer current device/session location.
+model CustomerCurrentLocation {
+  id        String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String         @unique @map("user_id") @db.Uuid
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  latitude  Float
+  longitude Float
+  accuracy  Float?
+  address   String?
+  source    LocationSource @default(BROWSER_GPS)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("customer_current_locations")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Booking Domain, Driver Matching, Assignment & Booking State Machine
+// ---------------------------------------------------------------------------
+
+enum BookingStatus {
+  DRAFT
+  SEARCHING_DRIVER
+  DRIVER_ASSIGNED
+  DRIVER_EN_ROUTE
+  DRIVER_ARRIVED
+  TRIP_IN_PROGRESS
+  TRIP_COMPLETED
+  CANCELLED
+  EXPIRED
+
+  @@map("booking_status")
+}
+
+enum BookingType {
+  ONE_WAY
+  ROUND_TRIP
+  HOURLY
+  FULL_DAY
+  MULTI_DAY
+
+  @@map("booking_type")
+}
+
+enum AssignmentAttemptStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CANCELLED
+
+  @@map("assignment_attempt_status")
+}
+
+/// Core marketplace booking record. Stores customer booking snapshot, status,
+/// location snapshot, driver assignment reference, and lifecycle metadata.
+model Booking {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  idempotencyKey String? @unique @map("idempotency_key")
+  customerId     String  @map("customer_id") @db.Uuid
+  customer       User    @relation("CustomerBookings", fields: [customerId], references: [id], onDelete: Cascade)
+
+  driverProfileId String?        @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile? @relation("DriverBookings", fields: [driverProfileId], references: [id], onDelete: SetNull)
+
+  /// Customer's non-binding preference, set at booking creation from one of
+  /// their own CustomerFavoriteDriver entries. Read by matching-service to
+  /// prioritize this driver if (and only if) they surface as an eligible,
+  /// nearby candidate in the normal dispatch pool — never bypasses
+  /// eligibility/availability/schedule/compliance/distance checks, and never
+  /// guarantees assignment. driverProfileId above remains the sole source of
+  /// truth for who was actually assigned.
+  preferredDriverProfileId String?        @map("preferred_driver_profile_id") @db.Uuid
+  preferredDriver          DriverProfile? @relation("PreferredDriverBookings", fields: [preferredDriverProfileId], references: [id], onDelete: SetNull)
+
+  status      BookingStatus @default(DRAFT)
+  bookingType BookingType   @default(ONE_WAY) @map("booking_type")
+
+  // Pickup location snapshot for historical correctness
+  pickupLatitude  Float   @map("pickup_latitude")
+  pickupLongitude Float   @map("pickup_longitude")
+  pickupAddress   String  @map("pickup_address")
+  pickupLabel     String? @map("pickup_label")
+
+  // Dropoff location snapshot (optional for flexible trips / required for one-way)
+  dropoffLatitude  Float?  @map("dropoff_latitude")
+  dropoffLongitude Float?  @map("dropoff_longitude")
+  dropoffAddress   String? @map("dropoff_address")
+  dropoffLabel     String? @map("dropoff_label")
+
+  // Booking package & pricing parameters
+  numberOfDays       Int?      @map("number_of_days")
+  hourlyPackageHours Int?      @map("hourly_package_hours")
+  returnDate         DateTime? @map("return_date") @db.Timestamptz(6)
+
+  // Fare calculation and route snapshot
+  estimatedDistanceKm   Float?   @map("estimated_distance_km")
+  estimatedFareAmount   Decimal? @map("estimated_fare_amount") @db.Decimal(12, 4)
+  finalFareAmount       Decimal? @map("final_fare_amount") @db.Decimal(12, 4)
+  pricingSnapshot       Json?    @map("pricing_snapshot")
+  routeEstimateSnapshot Json?    @map("route_estimate_snapshot")
+
+  /// Frozen promotion terms, if any, validated and applied at booking
+  /// creation time (see promotion-eligibility-service.ts). A later change to
+  /// the Promotion row (or its deactivation) never alters these — the same
+  /// immutable-snapshot treatment as pricingSnapshot above and
+  /// Payment.commissionPercentageSnapshot.
+  promotionId           String?                @map("promotion_id") @db.Uuid
+  promotionCodeSnapshot String?                @map("promotion_code_snapshot")
+  discountType          PromotionDiscountType? @map("discount_type")
+  discountAmount        Decimal?               @map("discount_amount") @db.Decimal(12, 4)
+
+  requestedStartTime       DateTime? @map("requested_start_time") @db.Timestamptz(6)
+  estimatedDurationMinutes Int?      @map("estimated_duration_minutes")
+  customerNotes            String?   @map("customer_notes")
+
+  requestedAt        DateTime  @default(now()) @map("requested_at") @db.Timestamptz(6)
+  searchStartedAt    DateTime? @map("search_started_at") @db.Timestamptz(6)
+  assignedAt         DateTime? @map("assigned_at") @db.Timestamptz(6)
+  driverEnRouteAt    DateTime? @map("driver_en_route_at") @db.Timestamptz(6)
+  driverArrivedAt    DateTime? @map("driver_arrived_at") @db.Timestamptz(6)
+  tripStartedAt      DateTime? @map("trip_started_at") @db.Timestamptz(6)
+  tripCompletedAt    DateTime? @map("trip_completed_at") @db.Timestamptz(6)
+  cancelledAt        DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  cancelledBy        String?   @map("cancelled_by") @db.Uuid
+  cancellationReason String?   @map("cancellation_reason")
+  expiresAt          DateTime? @map("expires_at") @db.Timestamptz(6)
+
+  ridePinVerifiedAt               DateTime? @map("ride_pin_verified_at") @db.Timestamptz(6)
+  ridePinVerifiedByDriverId       String?   @map("ride_pin_verified_by_driver_id") @db.Uuid
+  ridePinVerificationAttemptCount Int       @default(0) @map("ride_pin_verification_attempt_count")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  assignmentAttempts BookingAssignmentAttempt[]
+  bookingLogs        BookingLog[]
+  payments           Payment[]
+  safetyIncidents    SafetyIncident[]           @relation("BookingSafetyIncidents")
+  disputes           Dispute[]                  @relation("BookingDisputes")
+  review             Review?
+  promotionUsage     PromotionUsage?
+  supportTickets           SupportTicket[]
+  callSessions             CallSession[]
+  taxInvoice               TaxInvoice?
+  loyaltyTransactions      LoyaltyPointTransaction[]  @relation("BookingLoyaltyTransactions")
+  scheduledRideId          String?                    @map("scheduled_ride_id") @db.Uuid
+  scheduledRide            ScheduledRide?             @relation("GeneratedBookings", fields: [scheduledRideId], references: [id], onDelete: SetNull)
+  scheduledRideOccurrences ScheduledRideOccurrenceLog[]
+  tripIntelligenceEvents   TripIntelligenceEvent[]
+  reliabilityIncidents     TripReliabilityIncident[]  @relation("BookingReliabilityIncidents")
+
+  // Corporate / Business Travel extension fields
+  organizationId    String?                   @map("organization_id") @db.Uuid
+  organization      Organization?             @relation("OrganizationBookings", fields: [organizationId], references: [id], onDelete: SetNull)
+  bookedForUserId   String?                   @map("booked_for_user_id") @db.Uuid
+  bookedForUser     User?                     @relation("BookedForUserBookings", fields: [bookedForUserId], references: [id], onDelete: SetNull)
+  costCenterId      String?                   @map("cost_center_id") @db.Uuid
+  costCenter        OrganizationCostCenter?   @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  departmentId      String?                   @map("department_id") @db.Uuid
+  department        OrganizationDepartment?   @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  businessPurpose   String?                   @map("business_purpose")
+  approvalRequestId String?                   @map("approval_request_id") @db.Uuid
+  approvalRequest   CorporateApprovalRequest? @relation(fields: [approvalRequestId], references: [id], onDelete: SetNull)
+
+  @@index([customerId, status])
+  @@index([driverProfileId, status])
+  @@index([organizationId, status])
+  @@index([scheduledRideId])
+  @@index([status, createdAt])
+  @@map("bookings")
+}
+
+/// Explicit entity representing a driver assignment offer attempt for a booking.
+model BookingAssignmentAttempt {
+  id              String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId       String                  @map("booking_id") @db.Uuid
+  booking         Booking                 @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  driverProfileId String                  @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile           @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  attemptNumber   Int                     @map("attempt_number")
+  status          AssignmentAttemptStatus @default(PENDING)
+  offeredAt       DateTime                @default(now()) @map("offered_at") @db.Timestamptz(6)
+  respondedAt     DateTime?               @map("responded_at") @db.Timestamptz(6)
+  expiresAt       DateTime                @map("expires_at") @db.Timestamptz(6)
+  rejectionReason String?                 @map("rejection_reason")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([bookingId, attemptNumber])
+  @@index([driverProfileId, status])
+  @@index([status, expiresAt])
+  @@map("booking_assignment_attempts")
+}
+
+/// Append-only transition log for bookings.
+model BookingLog {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId   String  @map("booking_id") @db.Uuid
+  booking     Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  actorUserId String? @map("actor_user_id") @db.Uuid
+  fromStatus  String  @map("from_status")
+  toStatus    String  @map("to_status")
+  action      String
+  reason      String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([bookingId, createdAt])
+  @@map("booking_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: Payments, Razorpay, Commission, Financial Ledger, Wallet & Settlement
+//
+// Chart of accounts (seeded as LedgerAccount rows, see prisma/seed.ts):
+//   PAYMENT_PROVIDER_CLEARING   (asset)     Funds Razorpay holds/has settled to the
+//                                           platform on the platform's behalf.
+//                                           Debited on capture, credited on refund.
+//   PLATFORM_REVENUE_COMMISSION (revenue)   Platform's earned commission. Credited on
+//                                           capture, debited (reversed) on refund.
+//   DRIVER_PAYABLE               (liability) What the platform owes drivers for
+//                                           completed, paid trips. Credited on capture,
+//                                           debited on refund (clawback) and on
+//                                           settlement creation (moves to clearing).
+//   SETTLEMENT_CLEARING          (liability) Driver-payable amounts earmarked for
+//                                           payout. Credited (increased) when a
+//                                           settlement is created, debited when that
+//                                           settlement is confirmed paid or reversed
+//                                           (released back to DRIVER_PAYABLE) if it fails.
+//   PLATFORM_BANK_ACCOUNT        (asset)     The platform's operating bank account.
+//                                           Credited (decreased) when a settlement is
+//                                           confirmed paid. Razorpay's own settlement of
+//                                           collected funds into this account is out of
+//                                           scope (no bank reconciliation in this phase).
+//
+// One payment capture posts a single balanced FinancialTransaction:
+//   Dr PAYMENT_PROVIDER_CLEARING          amount
+//       Cr PLATFORM_REVENUE_COMMISSION        commissionAmount
+//       Cr DRIVER_PAYABLE                     driverEarningsAmount
+// A refund posts the exact proportional reversal (see refund-service.ts).
+// A settlement posts Dr DRIVER_PAYABLE / Cr SETTLEMENT_CLEARING on creation;
+// Dr SETTLEMENT_CLEARING / Cr PLATFORM_BANK_ACCOUNT when confirmed paid; or
+// the exact reversal of the creation posting if it fails/is cancelled before
+// being paid. Ledger entries and FinancialTransaction rows are never updated
+// or deleted after posting — see ledger-service.ts.
+// ---------------------------------------------------------------------------
+
+/// A Payment's own refund-in-progress state is intentionally NOT modeled
+/// here (no REFUND_PENDING) — an individual Refund already tracks its own
+/// PENDING/PROCESSING/PROCESSED/FAILED lifecycle (RefundStatus below), and a
+/// Payment can have several Refunds over time, so "pending" is a property of
+/// one Refund, not of the Payment as a whole.
+enum PaymentStatus {
+  CREATED
+  PROCESSING
+  CAPTURED
+  FAILED
+  CANCELLED
+  PARTIALLY_REFUNDED
+  REFUNDED
+
+  @@map("payment_status")
+}
+
+enum PaymentAttemptStatus {
+  INITIATED
+  SUCCEEDED
+  FAILED
+
+  @@map("payment_attempt_status")
+}
+
+enum WebhookProcessingStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+
+  @@map("webhook_processing_status")
+}
+
+enum LedgerBalanceSide {
+  DEBIT
+  CREDIT
+
+  @@map("ledger_balance_side")
+}
+
+enum FinancialTransactionType {
+  PAYMENT_CAPTURED
+  PAYMENT_REFUNDED
+  SETTLEMENT_CREATED
+  SETTLEMENT_PAID
+  SETTLEMENT_REVERSED
+  REFERRAL_REWARD
+  INCENTIVE_REWARD
+
+  @@map("financial_transaction_type")
+}
+
+enum SettlementStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+  CANCELLED
+
+  @@map("settlement_status")
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+
+  @@map("refund_status")
+}
+
+enum WalletChangeType {
+  EARNING_RECOGNIZED
+  EARNING_REVERSED
+  SETTLEMENT_RESERVED
+  SETTLEMENT_RELEASED
+  SETTLEMENT_COMPLETED
+  INCENTIVE_REWARD
+
+  @@map("wallet_change_type")
+}
+
+enum IncentiveCampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  EXPIRED
+  ARCHIVED
+
+  @@map("incentive_campaign_status")
+}
+
+enum IncentiveType {
+  TRIP_COUNT
+  EARNINGS_THRESHOLD
+  TIME_WINDOW
+
+  @@map("incentive_type")
+}
+
+enum IncentiveProgressStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  QUALIFIED
+  REWARDED
+
+  @@map("incentive_progress_status")
+}
+
+/// Business-level payment for a booking. A booking may have more than one
+/// Payment row over time (a FAILED/CANCELLED attempt does not block retrying),
+/// but application code enforces at most one non-terminal Payment per booking.
+model Payment {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId  String  @map("booking_id") @db.Uuid
+  booking    Booking @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  customerId String  @map("customer_id") @db.Uuid
+  customer   User    @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  /// Snapshot of which driver earns from this payment (copied from
+  /// booking.driverProfileId at capture time). A loose reference, not a
+  /// relation — consistent with other actor/reference columns in this schema
+  /// (e.g. Booking.cancelledBy) that intentionally don't force a back-relation.
+  driverProfileId String? @map("driver_profile_id") @db.Uuid
+
+  amount   Decimal       @db.Decimal(19, 4)
+  currency String        @default("INR")
+  status   PaymentStatus @default(CREATED)
+
+  provider          String  @default("razorpay")
+  providerOrderId   String? @map("provider_order_id")
+  providerPaymentId String? @map("provider_payment_id")
+
+  /// Client-supplied key for the "create payment order" request. Prevents
+  /// creating two orders for the same checkout attempt on retry/double-click.
+  idempotencyKey String? @unique @map("idempotency_key")
+
+  /// Commission snapshot, fixed at capture time so a later SystemConfiguration
+  /// change never retroactively changes an already-captured payment's split.
+  commissionPercentageSnapshot Decimal? @map("commission_percentage_snapshot") @db.Decimal(7, 4)
+  commissionAmount             Decimal? @map("commission_amount") @db.Decimal(19, 4)
+  driverEarningsAmount         Decimal? @map("driver_earnings_amount") @db.Decimal(19, 4)
+
+  /// Copied from the Booking's frozen promotion snapshot at payment-creation
+  /// time (never recalculated). `amount` above is already net of this
+  /// discount — it is what Razorpay actually charges. Commission and driver
+  /// earnings are calculated on the gross fare (amount + discountAmount), so
+  /// a platform-funded promotion never reduces what the driver is owed; see
+  /// capturePayment's ledger posting, which books the gap as
+  /// PROMOTION_DISCOUNT_EXPENSE.
+  promotionId           String?  @map("promotion_id") @db.Uuid
+  promotionCodeSnapshot String?  @map("promotion_code_snapshot")
+  discountAmount        Decimal? @map("discount_amount") @db.Decimal(19, 4)
+
+  failureReason String?   @map("failure_reason")
+  capturedAt    DateTime? @map("captured_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  attempts    PaymentAttempt[]
+  refunds     Refund[]
+  taxInvoices TaxInvoice[]
+
+  @@index([bookingId])
+  @@index([customerId, status])
+  @@index([status, createdAt])
+  /// Supports the admin payments list's unfiltered "newest 200" query
+  /// (listAllPayments) — a bare createdAt DESC scan with no status
+  /// predicate, which none of the other indexes (all status-prefixed) cover.
+  @@index([createdAt])
+  @@map("payments")
+}
+
+/// One provider interaction (order creation, verification, or fetch) for a
+/// Payment. A Payment may have several attempts (e.g. a failed try followed
+/// by a retry that succeeds). Only a sanitized response snapshot is kept —
+/// never raw card/PAN data.
+model PaymentAttempt {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentId String  @map("payment_id") @db.Uuid
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  provider          String
+  providerOrderId   String?              @map("provider_order_id")
+  providerPaymentId String?              @map("provider_payment_id")
+  status            PaymentAttemptStatus @default(INITIATED)
+
+  failureCode      String? @map("failure_code")
+  failureReason    String? @map("failure_reason")
+  /// Sanitized snapshot only (status/ids/amount) — never the full raw
+  /// provider payload, which may carry more than is safe to retain.
+  responseSnapshot Json?   @map("response_snapshot") @db.JsonB
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([paymentId, createdAt])
+  @@map("payment_attempts")
+}
+
+/// Every relevant incoming Razorpay webhook, persisted before processing.
+/// providerEventId is the `x-razorpay-event-id` header when present, else a
+/// content hash of the raw body (see webhook-service.ts) — either way it is
+/// stable across Razorpay's own retries of the same delivery, which is what
+/// the unique constraint relies on for duplicate-safe, idempotent processing.
+model PaymentWebhookEvent {
+  id                String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider          String  @default("razorpay")
+  providerEventId   String  @map("provider_event_id")
+  eventType         String  @map("event_type")
+  payload           Json    @db.JsonB
+  signatureVerified Boolean @map("signature_verified")
+
+  processingStatus WebhookProcessingStatus @default(RECEIVED) @map("processing_status")
+  processedAt      DateTime?               @map("processed_at") @db.Timestamptz(6)
+  errorDetails     String?                 @map("error_details")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([provider, providerEventId])
+  @@index([processingStatus, createdAt])
+  @@map("payment_webhook_events")
+}
+
+/// Chart-of-accounts metadata only — an account's balance is always derived
+/// by summing its LedgerEntry rows, never stored directly on this row.
+model LedgerAccount {
+  id            String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code          String            @unique
+  name          String
+  description   String
+  normalBalance LedgerBalanceSide @map("normal_balance")
+  /// Seeded system accounts (see chart of accounts above); not
+  /// creatable/deletable through admin tooling.
+  isSystem      Boolean           @default(true) @map("is_system")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  entries LedgerEntry[]
+
+  @@map("ledger_accounts")
+}
+
+/// One logical, balanced accounting event (e.g. "payment captured"). Immutable
+/// once created: never updated, never deleted. A correction is a new
+/// FinancialTransaction whose `reversesTransactionId` points back at this one
+/// — the original's rows are never touched.
+model FinancialTransaction {
+  id              String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  transactionType FinancialTransactionType @map("transaction_type")
+
+  /// What business entity this transaction was posted for (e.g. "Payment",
+  /// "DriverSettlement") — a loose polymorphic reference, matching AuditLog's
+  /// entityType/entityId, not a hard per-type FK.
+  referenceEntityType String @map("reference_entity_type")
+  referenceEntityId   String @map("reference_entity_id") @db.Uuid
+
+  /// Prevents double-posting the same logical event (e.g. the same webhook
+  /// delivery processed twice must never post two FinancialTransactions).
+  idempotencyKey String? @unique @map("idempotency_key")
+
+  description           String
+  /// Self-reference: set only on a compensating/reversing transaction.
+  reversesTransactionId String? @map("reverses_transaction_id") @db.Uuid
+  metadata              Json?   @db.JsonB
+
+  postedAt  DateTime @default(now()) @map("posted_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  entries            LedgerEntry[]
+  walletTransactions WalletTransaction[]
+  incentiveProgress  DriverIncentiveProgress?
+
+  @@index([referenceEntityType, referenceEntityId])
+  @@index([transactionType, postedAt])
+  @@map("financial_transactions")
+}
+
+/// One debit or credit line of a FinancialTransaction. Exactly one of
+/// debitAmount/creditAmount is non-zero per row (enforced in
+/// ledger-service.ts and by the deferred trigger in
+/// prisma/sql/001_ledger_balance_trigger.sql, which also enforces
+/// SUM(debits) = SUM(credits) per financial_transaction_id at commit time).
+model LedgerEntry {
+  id                     String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  financialTransactionId String               @map("financial_transaction_id") @db.Uuid
+  financialTransaction   FinancialTransaction @relation(fields: [financialTransactionId], references: [id], onDelete: Restrict)
+  ledgerAccountId        String               @map("ledger_account_id") @db.Uuid
+  ledgerAccount          LedgerAccount        @relation(fields: [ledgerAccountId], references: [id], onDelete: Restrict)
+
+  debitAmount  Decimal @default(0) @map("debit_amount") @db.Decimal(19, 4)
+  creditAmount Decimal @default(0) @map("credit_amount") @db.Decimal(19, 4)
+  currency     String  @default("INR")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([financialTransactionId])
+  @@index([ledgerAccountId])
+  @@map("ledger_entries")
+}
+
+/// Driver balance projection. Read model only — the ledger remains
+/// authoritative. Never updated directly by an API; every change is derived
+/// from a FinancialTransaction and recorded as a WalletTransaction in the
+/// same DB transaction (see wallet-service.ts).
+model DriverWallet {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId String        @unique @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id], onDelete: Restrict)
+
+  /// Eligible for settlement. In this phase, newly recognized earnings are
+  /// credited here directly (no hold period yet — see wallet-service.ts).
+  availableBalance Decimal @default(0) @map("available_balance") @db.Decimal(19, 4)
+  /// Reserved for future use by a hold-period policy; not populated by any
+  /// code path in this phase (always 0). Kept so that policy can be added
+  /// later without a schema migration.
+  pendingBalance   Decimal @default(0) @map("pending_balance") @db.Decimal(19, 4)
+  /// Earmarked by an in-flight (PENDING/PROCESSING) settlement.
+  reservedBalance  Decimal @default(0) @map("reserved_balance") @db.Decimal(19, 4)
+  totalEarned      Decimal @default(0) @map("total_earned") @db.Decimal(19, 4)
+  totalSettled     Decimal @default(0) @map("total_settled") @db.Decimal(19, 4)
+  currency         String  @default("INR")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  transactions WalletTransaction[]
+  settlements  DriverSettlement[]
+
+  @@map("driver_wallets")
+}
+
+/// Append-only explanation of why a driver's wallet balance changed. Snapshots
+/// all three balances *after* the change for straightforward auditing/debugging.
+model WalletTransaction {
+  id                     String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverWalletId         String               @map("driver_wallet_id") @db.Uuid
+  driverWallet           DriverWallet         @relation(fields: [driverWalletId], references: [id], onDelete: Cascade)
+  financialTransactionId String               @map("financial_transaction_id") @db.Uuid
+  financialTransaction   FinancialTransaction @relation(fields: [financialTransactionId], references: [id], onDelete: Restrict)
+
+  changeType     WalletChangeType @map("change_type")
+  /// Signed per-bucket deltas (positive increases, negative decreases). Kept
+  /// separate rather than collapsed into one "amount" because a single
+  /// change can move money *between* buckets (e.g. settlement reservation:
+  /// availableDelta -100, reservedDelta +100) — netting those into one
+  /// number would misleadingly show 0 for a real 100 movement.
+  availableDelta Decimal          @default(0) @map("available_delta") @db.Decimal(19, 4)
+  pendingDelta   Decimal          @default(0) @map("pending_delta") @db.Decimal(19, 4)
+  reservedDelta  Decimal          @default(0) @map("reserved_delta") @db.Decimal(19, 4)
+
+  balanceAfterAvailable Decimal @map("balance_after_available") @db.Decimal(19, 4)
+  balanceAfterPending   Decimal @map("balance_after_pending") @db.Decimal(19, 4)
+  balanceAfterReserved  Decimal @map("balance_after_reserved") @db.Decimal(19, 4)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Guarantees applyWalletChange is safe to call twice for the same
+  /// FinancialTransaction (e.g. a webhook and a client-verify call racing to
+  /// capture the same payment) — the second call's insert is rejected at the
+  /// database level, not just by an application-level check-then-act guard.
+  @@unique([driverWalletId, financialTransactionId])
+  @@index([driverWalletId, createdAt])
+  @@map("wallet_transactions")
+}
+
+/// Driver payout lifecycle. Creating a settlement reserves funds (moves them
+/// from availableBalance to reservedBalance and posts DRIVER_PAYABLE ->
+/// SETTLEMENT_CLEARING); there is no unconstrained "mark paid" — every
+/// transition goes through settlement-service.ts's state machine.
+model DriverSettlement {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId String        @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id], onDelete: Restrict)
+  driverWalletId  String        @map("driver_wallet_id") @db.Uuid
+  driverWallet    DriverWallet  @relation(fields: [driverWalletId], references: [id], onDelete: Restrict)
+
+  amount     Decimal          @db.Decimal(19, 4)
+  amountPaid Decimal?         @map("amount_paid") @db.Decimal(19, 4)
+  currency   String           @default("INR")
+  status     SettlementStatus @default(PENDING)
+
+  /// "manual" in this phase (no automated payout provider is configured yet
+  /// — see settlement-service.ts); ready for a future real payout provider.
+  payoutProvider  String? @map("payout_provider")
+  payoutReference String? @map("payout_reference")
+
+  /// Loose references (not relations), consistent with other actor columns.
+  requestedBy String? @map("requested_by") @db.Uuid
+  processedBy String? @map("processed_by") @db.Uuid
+
+  /// Loose references to the reserving/reversing FinancialTransaction rows.
+  financialTransactionId         String? @map("financial_transaction_id") @db.Uuid
+  reversalFinancialTransactionId String? @map("reversal_financial_transaction_id") @db.Uuid
+
+  failureReason String?   @map("failure_reason")
+  initiatedAt   DateTime? @map("initiated_at") @db.Timestamptz(6)
+  completedAt   DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([driverProfileId, status])
+  @@index([status, createdAt])
+  @@map("driver_settlements")
+}
+
+/// Full or partial refund of a captured Payment. Never mutates the original
+/// Payment/ledger rows — always creates a compensating FinancialTransaction.
+model Refund {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentId String  @map("payment_id") @db.Uuid
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  amount   Decimal      @db.Decimal(19, 4)
+  currency String       @default("INR")
+  status   RefundStatus @default(PENDING)
+  reason   String?
+
+  /// Optional client-supplied key guarding against an accidental duplicate
+  /// refund request; the maximum-refundable-amount check (in
+  /// refund-service.ts) is the primary defense against over-refunding.
+  idempotencyKey String? @unique @map("idempotency_key")
+
+  providerRefundId       String? @map("provider_refund_id")
+  /// Loose reference to the actor (admin) who initiated this refund.
+  initiatedBy            String  @map("initiated_by") @db.Uuid
+  /// Loose reference to the compensating FinancialTransaction once posted.
+  financialTransactionId String? @map("financial_transaction_id") @db.Uuid
+
+  failureReason String?   @map("failure_reason")
+  processedAt   DateTime? @map("processed_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([paymentId, status])
+  @@map("refunds")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 20: Promotions, Coupons, Offers & Growth Eligibility Engine
+//
+// Deliberately minimal: two models cover every required capability
+// (code-based and automatic promotions, date windows, global and per-user
+// usage limits, percentage/fixed discounts with a cap, minimum booking
+// value, first-ride eligibility) without a generic "PromotionRule" table —
+// the rule set is small and fixed today, so plain typed/indexed columns are
+// simpler and more query-able than a polymorphic rules blob.
+//
+// Concurrency-safe usage limits: application code takes `SELECT ... FOR
+// UPDATE` on the Promotion row inside the same transaction that creates the
+// Booking, serializing every concurrent redemption attempt for that
+// promotion (see promotion-eligibility-service.ts) — the same idiom already
+// used by outbox-dispatcher-service.ts's `FOR UPDATE SKIP LOCKED` claim
+// query. `totalUsageCount` is only ever mutated under that lock. The
+// `@@unique([bookingId])` below is the second, independent guarantee: a
+// single booking can never register two promotion usages even if
+// application logic were ever called twice for it.
+//
+// Historical immutability: Booking and Payment each freeze the promotion
+// terms that applied to them (promotionCodeSnapshot, discountType,
+// discountAmount, ...) at the moment the discount was applied/charged —
+// exactly the same pattern as Booking.pricingSnapshot and
+// Payment.commissionPercentageSnapshot. A later edit to the Promotion row
+// (e.g. an admin changing discountValue) never touches these snapshots.
+// ---------------------------------------------------------------------------
+
+enum PromotionDiscountType {
+  PERCENTAGE
+  FIXED
+
+  @@map("promotion_discount_type")
+}
+
+/// DRAFT -> ACTIVE -> PAUSED -> ACTIVE (resume) -> ARCHIVED, or ACTIVE ->
+/// ARCHIVED directly. EXPIRED is deliberately NOT a stored transition here —
+/// there is no background scheduler in this codebase to sweep promotions on
+/// their endsAt date (adding one would mean introducing a second
+/// job-scheduling mechanism alongside the transactional outbox/worker, which
+/// Phase 20 explicitly must not do). Instead "expired" is a *derived* read
+/// state: an ACTIVE promotion whose endsAt has passed is treated as
+/// unavailable wherever eligibility is evaluated, without ever mutating its
+/// stored status column. See promotion-state-machine.ts.
+enum PromotionStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ARCHIVED
+
+  @@map("promotion_status")
+}
+
+model Promotion {
+  id   String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Null => an automatic promotion (e.g. first-ride) that is evaluated and
+  /// applied without the customer entering a code. Unique so a code can
+  /// unambiguously resolve to one promotion.
+  code String? @unique
+
+  name        String
+  description String?
+
+  discountType      PromotionDiscountType @map("discount_type")
+  /// Percentage points (0-100) when discountType=PERCENTAGE, or a flat
+  /// rupee amount when discountType=FIXED.
+  discountValue     Decimal               @map("discount_value") @db.Decimal(12, 4)
+  /// Caps the computed discount; only meaningful for PERCENTAGE (a FIXED
+  /// discount is already a hard amount). Null = uncapped.
+  maxDiscountAmount Decimal?              @map("max_discount_amount") @db.Decimal(12, 4)
+  /// Minimum gross fare required for this promotion to apply.
+  minBookingValue   Decimal?              @map("min_booking_value") @db.Decimal(12, 4)
+
+  /// Eligibility restricted to a customer with zero prior TRIP_COMPLETED
+  /// bookings (see promotion-eligibility-service.ts's isFirstRideCustomer).
+  firstRideOnly Boolean @default(false) @map("first_ride_only")
+  /// True = auto-applied to an eligible booking with no code required
+  /// (still subject to every other eligibility rule). A promotion may be
+  /// both code-based (non-null code) and NOT automatic — the normal case —
+  /// or code-less and automatic (e.g. first-ride).
+  isAutomatic   Boolean @default(false) @map("is_automatic")
+
+  status   PromotionStatus @default(DRAFT)
+  startsAt DateTime        @map("starts_at") @db.Timestamptz(6)
+  endsAt   DateTime?       @map("ends_at") @db.Timestamptz(6)
+
+  /// Null = unlimited redemptions platform-wide.
+  totalUsageLimit   Int? @map("total_usage_limit")
+  /// Authoritative running counter — mutated only inside a transaction that
+  /// holds a `FOR UPDATE` lock on this row (see module doc comment above).
+  totalUsageCount   Int  @default(0) @map("total_usage_count")
+  /// Null = unlimited redemptions per customer.
+  perUserUsageLimit Int? @default(1) @map("per_user_usage_limit")
+
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  usages PromotionUsage[]
+  loyaltyRewards LoyaltyReward[] @relation("RewardPromotion")
+
+  @@index([status])
+  @@index([startsAt, endsAt])
+  @@map("promotions")
+}
+
+/// One redemption record per booking. The authoritative snapshot a Booking
+/// carries (promotionCodeSnapshot etc. on Booking itself) is what payment
+/// and refund logic actually reads; this row exists to enforce usage limits
+/// and to give admins a queryable redemption history per promotion.
+model PromotionUsage {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  promotionId String    @map("promotion_id") @db.Uuid
+  promotion   Promotion @relation(fields: [promotionId], references: [id], onDelete: Restrict)
+  userId      String    @map("user_id") @db.Uuid
+  user        User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  bookingId   String    @unique @map("booking_id") @db.Uuid
+  booking     Booking   @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+
+  discountAmount        Decimal               @map("discount_amount") @db.Decimal(12, 4)
+  /// Frozen at redemption time — a later change to the Promotion row (code,
+  /// discount type/value) never alters this historical record.
+  promotionCodeSnapshot String?               @map("promotion_code_snapshot")
+  discountTypeSnapshot  PromotionDiscountType @map("discount_type_snapshot")
+  discountValueSnapshot Decimal               @map("discount_value_snapshot") @db.Decimal(12, 4)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([promotionId, userId])
+  @@map("promotion_usages")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9: Notifications, Push Delivery, Preferences & Admin Campaigns
+// ---------------------------------------------------------------------------
+
+enum NotificationType {
+  BOOKING_CREATED
+  BOOKING_DRIVER_OFFERED
+  BOOKING_DRIVER_ASSIGNED
+  BOOKING_DRIVER_EN_ROUTE
+  BOOKING_DRIVER_ARRIVED
+  BOOKING_TRIP_STARTED
+  BOOKING_TRIP_COMPLETED
+  BOOKING_CANCELLED
+  BOOKING_EXPIRED
+  PAYMENT_CREATED
+  PAYMENT_PROCESSING
+  PAYMENT_CAPTURED
+  PAYMENT_FAILED
+  PAYMENT_REFUNDED
+  DRIVER_APPLICATION_APPROVED
+  DRIVER_APPLICATION_REJECTED
+  DRIVER_APPLICATION_CHANGES_REQUESTED
+  DRIVER_DOCUMENT_VERIFIED
+  DRIVER_DOCUMENT_REJECTED
+  DRIVER_EARNINGS_RECOGNIZED
+  SETTLEMENT_CREATED
+  SETTLEMENT_COMPLETED
+  SETTLEMENT_FAILED
+  SYSTEM_ANNOUNCEMENT
+  SYSTEM_OFFER
+  SYSTEM_COUPON
+  SAFETY_SOS_TRIGGERED
+  SAFETY_INCIDENT_UPDATED
+  DISPUTE_CREATED
+  DISPUTE_UPDATED
+  DISPUTE_RESOLVED
+  DRIVER_RATING_RECEIVED
+  REVIEW_MODERATED
+  REFERRAL_INVITED
+  REFERRAL_QUALIFIED
+  REFERRAL_REWARDED
+  REFERRAL_CAMPAIGN_ACTIVATED
+  LOYALTY_POINTS_EARNED
+  LOYALTY_TIER_UPGRADED
+  REWARD_UNLOCKED
+  REWARD_REDEEMED
+  SCRATCH_CARD_AVAILABLE
+  SCRATCH_REWARD_REVEALED
+  PROMOTION_AVAILABLE
+  COUPON_AVAILABLE
+  COUPON_EXPIRING_SOON
+  INCENTIVE_PROGRESS
+  INCENTIVE_REWARDED
+  GOAL_PROGRESS
+  GOAL_COMPLETED
+  ACHIEVEMENT_UNLOCKED
+  STREAK_MILESTONE
+  SCHEDULED_RIDE_CREATED
+  SCHEDULED_RIDE_REMINDER
+  SCHEDULED_RIDE_GENERATED
+  SCHEDULED_RIDE_CANCELLED
+  SUPPORT_TICKET_CREATED
+  SUPPORT_TICKET_UPDATED
+  SUPPORT_MESSAGE_RECEIVED
+  INVOICE_READY
+  FAVORITE_DRIVER_AVAILABLE
+  ACCOUNT_SECURITY_UPDATE
+  ADMIN_SOS_ALERT
+  ADMIN_SUPPORT_ESCALATION
+  ADMIN_SETTLEMENT_FAILURE
+  ADMIN_DRIVER_DOCUMENT_PENDING
+  ADMIN_CAMPAIGN_LIMIT_REACHED
+
+  @@map("notification_type")
+}
+
+enum NotificationPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+
+  @@map("notification_priority")
+}
+
+enum NotificationStatus {
+  UNREAD
+  READ
+  ARCHIVED
+
+  @@map("notification_status")
+}
+
+enum DeliveryChannel {
+  IN_APP
+  PUSH
+  EMAIL
+  SMS
+
+  @@map("delivery_channel")
+}
+
+enum DeliveryStatus {
+  PENDING
+  QUEUED
+  PROCESSING
+  DELIVERED
+  FAILED
+  SKIPPED
+
+  @@map("delivery_status")
+}
+
+enum CampaignTargetAudience {
+  ALL_CUSTOMERS
+  ALL_DRIVERS
+  ALL_USERS
+  SELECTED_USERS
+
+  @@map("campaign_target_audience")
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  PROCESSING
+  COMPLETED
+  CANCELLED
+  FAILED
+
+  @@map("campaign_status")
+}
+
+/// Core in-app notification entity.
+model Notification {
+  id             String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String                @map("user_id") @db.Uuid
+  user           User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type           NotificationType
+  category       String?
+  title          String
+  body           String
+  data           Json?                 @db.JsonB
+  actionUrl      String?               @map("action_url")
+  imageAsset     String?               @map("image_asset")
+  priority       NotificationPriority  @default(NORMAL)
+  status         NotificationStatus    @default(UNREAD)
+  idempotencyKey String?               @unique @map("idempotency_key")
+  campaignId     String?               @map("campaign_id") @db.Uuid
+  campaign       NotificationCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  readAt         DateTime?             @map("read_at") @db.Timestamptz(6)
+  expiresAt      DateTime?             @map("expires_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  deliveries NotificationDelivery[]
+
+  @@index([userId, status, createdAt])
+  @@index([userId, createdAt])
+  @@index([userId, category, createdAt])
+  @@index([type])
+  @@map("notifications")
+}
+
+/// Delivery tracking per notification channel (In-App, Push, Email, SMS).
+model NotificationDelivery {
+  id                String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  notificationId    String          @map("notification_id") @db.Uuid
+  notification      Notification    @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  channel           DeliveryChannel
+  status            DeliveryStatus  @default(PENDING)
+  attemptCount      Int             @default(0) @map("attempt_count")
+  provider          String?
+  providerMessageId String?         @map("provider_message_id")
+  lastAttemptAt     DateTime?       @map("last_attempt_at") @db.Timestamptz(6)
+  deliveredAt       DateTime?       @map("delivered_at") @db.Timestamptz(6)
+  failedAt          DateTime?       @map("failed_at") @db.Timestamptz(6)
+  failureReason     String?         @map("failure_reason")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([notificationId, channel])
+  @@index([status])
+  @@map("notification_deliveries")
+}
+
+/// Web push notification subscriptions for browser clients.
+model PushSubscription {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint   String   @unique
+  p256dhKey  String   @map("p256dh_key")
+  authKey    String   @map("auth_key")
+  userAgent  String?  @map("user_agent")
+  deviceName String?  @map("device_name")
+  isActive   Boolean  @default(true) @map("is_active")
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([userId, isActive])
+  @@map("push_subscriptions")
+}
+
+/// Category-level notification preferences for users (BOOKING, PAYMENT, PROMOTION, SYSTEM, MARKETING, SAFETY).
+model NotificationPreference {
+  id       String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId   String  @map("user_id") @db.Uuid
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category String // BOOKING, PAYMENT, PROMOTION, SYSTEM, MARKETING, SAFETY
+  push     Boolean @default(true)
+  email    Boolean @default(true)
+  sms      Boolean @default(true)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([userId, category])
+  @@map("notification_preferences")
+}
+
+/// Administrative broadcast notification campaigns.
+model NotificationCampaign {
+  id             String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  title          String
+  body           String
+  targetAudience CampaignTargetAudience @map("target_audience")
+  targetUserIds  Json?                  @map("target_user_ids") @db.JsonB
+  status         CampaignStatus         @default(DRAFT)
+  createdBy      String                 @map("created_by") @db.Uuid
+  scheduledAt    DateTime?              @map("scheduled_at") @db.Timestamptz(6)
+  sentAt         DateTime?              @map("sent_at") @db.Timestamptz(6)
+  totalTargeted  Int                    @default(0) @map("total_targeted")
+  totalSent      Int                    @default(0) @map("total_sent")
+  totalFailed    Int                    @default(0) @map("total_failed")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  notifications Notification[]
+
+  @@index([status, scheduledAt])
+  @@map("notification_campaigns")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 12: SOS Safety, Emergency Response & Dispute Resolution
+// ---------------------------------------------------------------------------
+
+enum SafetyIncidentType {
+  SOS_EMERGENCY
+  ACCIDENT
+  MEDICAL_EMERGENCY
+  THREAT
+  HARASSMENT
+  VEHICLE_BREAKDOWN
+  UNSAFE_BEHAVIOR
+  OTHER
+
+  @@map("safety_incident_type")
+}
+
+enum SafetyIncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+
+  @@map("safety_incident_severity")
+}
+
+enum SafetyIncidentStatus {
+  OPEN
+  ACKNOWLEDGED
+  INVESTIGATING
+  RESOLVED
+  ESCALATED
+
+  @@map("safety_incident_status")
+}
+
+enum DisputeCategory {
+  PAYMENT_ISSUE
+  FARE_DISPUTE
+  DRIVER_CONDUCT
+  CUSTOMER_CONDUCT
+  TRIP_ROUTE
+  CANCELLATION
+  DAMAGE
+  OTHER
+
+  @@map("dispute_category")
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  ESCALATED
+  CANCELLED
+
+  @@map("dispute_status")
+}
+
+/// Safety incident recorded by customer or driver during/after trip, or via explicit SOS.
+model SafetyIncident {
+  id             String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  incidentNumber String                 @unique @map("incident_number")
+  type           SafetyIncidentType     @default(SOS_EMERGENCY)
+  severity       SafetyIncidentSeverity @default(CRITICAL)
+  status         SafetyIncidentStatus   @default(OPEN)
+
+  bookingId String?  @map("booking_id") @db.Uuid
+  booking   Booking? @relation("BookingSafetyIncidents", fields: [bookingId], references: [id], onDelete: SetNull)
+
+  reporterUserId String @map("reporter_user_id") @db.Uuid
+  reporterUser   User   @relation("ReporterSafetyIncidents", fields: [reporterUserId], references: [id], onDelete: Cascade)
+
+  customerId String? @map("customer_id") @db.Uuid
+  customer   User?   @relation("CustomerSafetyIncidents", fields: [customerId], references: [id], onDelete: SetNull)
+
+  driverProfileId String?        @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile? @relation("DriverSafetyIncidents", fields: [driverProfileId], references: [id], onDelete: SetNull)
+
+  assignedOperatorId String? @map("assigned_operator_id") @db.Uuid
+  assignedOperator   User?   @relation("AssignedSafetyIncidents", fields: [assignedOperatorId], references: [id], onDelete: SetNull)
+
+  latitude         Float?  @map("latitude")
+  longitude        Float?  @map("longitude")
+  locationAccuracy Float?  @map("location_accuracy")
+  snapshotAddress  String? @map("snapshot_address")
+
+  description       String?
+  resolutionSummary String? @map("resolution_summary")
+  idempotencyKey    String? @unique @map("idempotency_key")
+
+  acknowledgedAt DateTime? @map("acknowledged_at") @db.Timestamptz(6)
+  resolvedAt     DateTime? @map("resolved_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  timelineEntries SafetyIncidentTimeline[]
+
+  @@index([status, severity, createdAt])
+  /// A severity-only filter (e.g. "show all CRITICAL", no status filter)
+  /// cannot use the composite [status, severity, createdAt] index at all
+  /// since status is its leading column — this covers that case directly.
+  @@index([severity, createdAt])
+  @@index([bookingId])
+  @@index([reporterUserId])
+  @@index([customerId])
+  @@index([driverProfileId])
+  @@map("safety_incidents")
+}
+
+/// Immutable timeline logs for safety incident workflow actions and status updates.
+model SafetyIncidentTimeline {
+  id         String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  incidentId String         @map("incident_id") @db.Uuid
+  incident   SafetyIncident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  action      String
+  fromStatus  SafetyIncidentStatus? @map("from_status")
+  toStatus    SafetyIncidentStatus? @map("to_status")
+  performedBy String                @map("performed_by") @db.Uuid
+  actorUser   User                  @relation(fields: [performedBy], references: [id], onDelete: Cascade)
+  notes       String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([incidentId, createdAt])
+  @@map("safety_incident_timelines")
+}
+
+/// Customer or driver raised dispute regarding a booking, fare, or conduct.
+model Dispute {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  disputeNumber  String  @unique @map("dispute_number")
+  bookingId      String  @map("booking_id") @db.Uuid
+  booking        Booking @relation("BookingDisputes", fields: [bookingId], references: [id], onDelete: Cascade)
+  raisedByUserId String  @map("raised_by_user_id") @db.Uuid
+  raisedByUser   User    @relation("UserRaisedDisputes", fields: [raisedByUserId], references: [id], onDelete: Cascade)
+
+  assignedOperatorId String? @map("assigned_operator_id") @db.Uuid
+  assignedOperator   User?   @relation("AssignedDisputes", fields: [assignedOperatorId], references: [id], onDelete: SetNull)
+
+  category DisputeCategory @default(PAYMENT_ISSUE)
+  status   DisputeStatus   @default(OPEN)
+
+  reason                     String
+  evidenceUrls               Json?   @map("evidence_urls") @db.JsonB
+  resolutionSummary          String? @map("resolution_summary")
+  refundAmountMinorUnits     Int?    @map("refund_amount_minor_units")
+  financialAdjustmentSummary String? @map("financial_adjustment_summary")
+
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  logs DisputeLog[]
+
+  @@index([status, category, createdAt])
+  /// Supports the admin dispute list's common "filter by status alone"
+  /// case (no category) with createdAt ordering included, rather than
+  /// falling back to a residual sort once category isn't part of the filter.
+  @@index([status, createdAt])
+  @@index([bookingId])
+  @@index([raisedByUserId])
+  @@map("disputes")
+}
+
+/// Audit/timeline logs for dispute status transitions and operator notes.
+model DisputeLog {
+  id          String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  disputeId   String         @map("dispute_id") @db.Uuid
+  dispute     Dispute        @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+  action      String
+  fromStatus  DisputeStatus? @map("from_status")
+  toStatus    DisputeStatus? @map("to_status")
+  performedBy String         @map("performed_by") @db.Uuid
+  actorUser   User           @relation(fields: [performedBy], references: [id], onDelete: Cascade)
+  notes       String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([disputeId, createdAt])
+  @@map("dispute_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14: Referral Infrastructure, Referral Codes & Reward Qualifications
+// ---------------------------------------------------------------------------
+
+enum ReferralStatus {
+  PENDING
+  QUALIFIED
+  REWARDED
+  REJECTED
+
+  @@map("referral_status")
+}
+
+/// Unique referral code generated for each User.
+model UserReferralCode {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @unique @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  code   String @unique
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("user_referral_codes")
+}
+
+/// Referral relationship tracking between referrer and newly registered user.
+model Referral {
+  id              String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referrerUserId  String         @map("referrer_user_id") @db.Uuid
+  referrerUser    User           @relation("ReferrerUser", fields: [referrerUserId], references: [id], onDelete: Cascade)
+  referredUserId  String         @unique @map("referred_user_id") @db.Uuid
+  referredUser    User           @relation("ReferredUser", fields: [referredUserId], references: [id], onDelete: Cascade)
+  codeUsed        String         @map("code_used")
+  campaignId          String?           @map("campaign_id") @db.Uuid
+  campaign            ReferralCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  channel             String?           @default("CODE")
+  status              ReferralStatus    @default(PENDING)
+  rewardAmount        Decimal?          @map("reward_amount") @db.Decimal(19, 4)
+  refereeRewardAmount Decimal?          @map("referee_reward_amount") @db.Decimal(19, 4)
+  rejectionReason     String?           @map("rejection_reason")
+  qualifiedAt         DateTime?         @map("qualified_at") @db.Timestamptz(6)
+  rewardedAt          DateTime?         @map("rewarded_at") @db.Timestamptz(6)
+  refereeRewardedAt   DateTime?         @map("referee_rewarded_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([referrerUserId])
+  @@index([campaignId])
+  @@index([status])
+  @@map("referrals")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 39: Referral 2.0 Growth, Acquisition & Referral Campaign Engine
+// ---------------------------------------------------------------------------
+
+enum ReferralCampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  EXPIRED
+  ARCHIVED
+
+  @@map("referral_campaign_status")
+}
+
+enum ReferralAudience {
+  ALL
+  CUSTOMER
+  DRIVER
+
+  @@map("referral_audience")
+}
+
+enum ReferralRewardType {
+  MONETARY
+  LOYALTY_POINTS
+  PROMOTION_DISCOUNT
+
+  @@map("referral_reward_type")
+}
+
+/// Growth campaign definition for referral rewards and acquisition rules.
+model ReferralCampaign {
+  id                     String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                   String                 @unique
+  name                   String
+  description            String?
+  status                 ReferralCampaignStatus @default(DRAFT)
+  audience               ReferralAudience       @default(ALL)
+  rewardType             ReferralRewardType     @default(MONETARY) @map("reward_type")
+  referrerRewardValue    Decimal                @map("referrer_reward_value") @db.Decimal(19, 4)
+  refereeRewardValue     Decimal?               @map("referee_reward_value") @db.Decimal(19, 4)
+  maxRewardsTotal        Int?                   @map("max_rewards_total")
+  maxRewardsPerUser      Int?                   @map("max_rewards_per_user")
+  currentRewardCount     Int                    @default(0) @map("current_reward_count")
+  currentRewardSpent     Decimal                @default(0) @map("current_reward_spent") @db.Decimal(19, 4)
+  qualificationTrigger   String                 @default("CUSTOMER_FIRST_TRIP") @map("qualification_trigger")
+  qualificationMinTrips  Int                    @default(1) @map("qualification_min_trips")
+  qualificationMinAmount Decimal?               @map("qualification_min_amount") @db.Decimal(19, 4)
+  startsAt               DateTime?              @map("starts_at") @db.Timestamptz(6)
+  endsAt                 DateTime?              @map("ends_at") @db.Timestamptz(6)
+
+  referrals Referral[]
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([status])
+  @@index([audience])
+  @@index([startsAt, endsAt])
+  @@map("referral_campaigns")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 16: Reviews, Ratings, Driver Performance & Portfolio
+// ---------------------------------------------------------------------------
+
+/// Moderation lifecycle for a customer's review of a driver. PUBLISHED is the
+/// only status counted toward the public DriverRatingSummary aggregate.
+enum ReviewStatus {
+  PUBLISHED
+  FLAGGED
+  HIDDEN
+  REJECTED
+
+  @@map("review_status")
+}
+
+/// Customer's post-trip review of the driver assigned to a TRIP_COMPLETED
+/// booking. One review per booking — the unique constraint on bookingId is
+/// the final defense against duplicate submissions, not just the
+/// eligibility check in review-service.ts. `rating` is additionally
+/// constrained to 1-5 by a hand-added CHECK constraint (see the migration
+/// SQL) since Prisma's schema language has no native range-check attribute.
+model Review {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId String  @unique @map("booking_id") @db.Uuid
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+
+  customerId String @map("customer_id") @db.Uuid
+  customer   User   @relation("CustomerReviews", fields: [customerId], references: [id], onDelete: Restrict)
+
+  driverProfileId String        @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile @relation("DriverReviews", fields: [driverProfileId], references: [id], onDelete: Restrict)
+
+  rating  Int
+  comment String?
+
+  status ReviewStatus @default(PUBLISHED)
+
+  /// Loose reference to the admin who took the most recent moderation
+  /// action, consistent with other actor columns in this schema (e.g.
+  /// Booking.cancelledBy) — not a relation.
+  moderationReason String?   @map("moderation_reason")
+  moderatedBy      String?   @map("moderated_by") @db.Uuid
+  moderatedAt      DateTime? @map("moderated_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([driverProfileId, status, createdAt])
+  @@index([customerId])
+  @@index([status, createdAt])
+  @@map("reviews")
+}
+
+/// Denormalized, transactionally-maintained rating aggregate for a driver —
+/// one row per DriverProfile, updated atomically via a single INSERT ... ON
+/// CONFLICT DO UPDATE statement in review-service.ts (never a read-modify-
+/// write in application code, so concurrent submissions can't race). Mirrors
+/// the DriverWallet pattern: a dedicated aggregate model rather than loose
+/// rating fields bolted onto DriverProfile.
+model DriverRatingSummary {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId String        @unique @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+
+  totalReviews  Int     @default(0) @map("total_reviews")
+  ratingSum     Int     @default(0) @map("rating_sum")
+  averageRating Decimal @default(0) @map("average_rating") @db.Decimal(3, 2)
+
+  fiveStarCount  Int @default(0) @map("five_star_count")
+  fourStarCount  Int @default(0) @map("four_star_count")
+  threeStarCount Int @default(0) @map("three_star_count")
+  twoStarCount   Int @default(0) @map("two_star_count")
+  oneStarCount   Int @default(0) @map("one_star_count")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("driver_rating_summaries")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 27: Production Customer Support & Ticketing System
+// ---------------------------------------------------------------------------
+
+enum SupportTicketCategory {
+  BOOKING_ISSUE
+  DRIVER_CONDUCT
+  PAYMENT_FARE
+  REFUND_REQUEST
+  PROMOTION_CODE
+  ACCOUNT_PROFILE
+  APP_TECHNICAL
+  SAFETY_CONCERN
+  OTHER
+
+  @@map("support_ticket_category")
+}
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_FOR_CUSTOMER
+  RESOLVED
+  CLOSED
+  REOPENED
+
+  @@map("support_ticket_status")
+}
+
+enum SupportTicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+
+  @@map("support_ticket_priority")
+}
+
+enum SupportTicketAuthorRole {
+  CUSTOMER
+  SUPPORT_AGENT
+  SYSTEM
+
+  @@map("support_ticket_author_role")
+}
+
+model SupportTicket {
+  id              String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ticketNumber    String                @unique @map("ticket_number")
+  customerId      String                @map("customer_id") @db.Uuid
+  customer        User                  @relation("CustomerSupportTickets", fields: [customerId], references: [id], onDelete: Restrict)
+  bookingId       String?               @map("booking_id") @db.Uuid
+  booking         Booking?              @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  category        SupportTicketCategory
+  status          SupportTicketStatus   @default(OPEN)
+  priority        SupportTicketPriority @default(NORMAL)
+  subject         String
+  description     String
+  assignedAdminId String?               @map("assigned_admin_id") @db.Uuid
+  assignedAdmin   User?                 @relation("AssignedSupportTickets", fields: [assignedAdminId], references: [id], onDelete: SetNull)
+
+  resolvedAt DateTime? @map("resolved_at") @db.Timestamptz(6)
+  closedAt   DateTime? @map("closed_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  messages     SupportMessage[]
+  callSessions CallSession[]
+
+  @@index([customerId, status, createdAt])
+  @@index([status, priority, createdAt])
+  @@index([bookingId])
+  @@index([assignedAdminId])
+  @@map("support_tickets")
+}
+
+model SupportMessage {
+  id             String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ticketId       String                  @map("ticket_id") @db.Uuid
+  ticket         SupportTicket           @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorUserId   String                  @map("author_user_id") @db.Uuid
+  authorUser     User                    @relation(fields: [authorUserId], references: [id], onDelete: Restrict)
+  authorRole     SupportTicketAuthorRole @map("author_role")
+  isInternalNote Boolean                 @default(false) @map("is_internal_note")
+  body           String
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([ticketId, isInternalNote, createdAt])
+  @@index([authorUserId])
+  @@map("support_messages")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 28: Production Calling & Masked Communication System
+// ---------------------------------------------------------------------------
+
+enum CallType {
+  CUSTOMER_TO_DRIVER
+  DRIVER_TO_CUSTOMER
+  CUSTOMER_TO_SUPPORT
+  DRIVER_TO_SUPPORT
+
+  @@map("call_type")
+}
+
+enum CallStatus {
+  REQUESTED
+  INITIATED
+  RINGING
+  ANSWERED
+  COMPLETED
+  FAILED
+  CANCELLED
+
+  @@map("call_status")
+}
+
+model CallSession {
+  id             String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider       String     @default("MOCK")
+  providerCallId String?    @unique @map("provider_call_id")
+  callType       CallType   @map("call_type")
+  status         CallStatus @default(REQUESTED)
+
+  initiatedByUserId String @map("initiated_by_user_id") @db.Uuid
+  initiatedByUser   User   @relation("InitiatedCalls", fields: [initiatedByUserId], references: [id], onDelete: Restrict)
+
+  customerId String @map("customer_id") @db.Uuid
+  customer   User   @relation("CustomerCalls", fields: [customerId], references: [id], onDelete: Restrict)
+
+  driverProfileId String?        @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile? @relation("DriverCalls", fields: [driverProfileId], references: [id], onDelete: SetNull)
+
+  bookingId String?  @map("booking_id") @db.Uuid
+  booking   Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  supportTicketId String?        @map("support_ticket_id") @db.Uuid
+  supportTicket   SupportTicket? @relation(fields: [supportTicketId], references: [id], onDelete: SetNull)
+
+  callerPhoneMasked    String? @map("caller_phone_masked")
+  recipientPhoneMasked String? @map("recipient_phone_masked")
+
+  startedAt       DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
+  answeredAt      DateTime? @map("answered_at") @db.Timestamptz(6)
+  endedAt         DateTime? @map("ended_at") @db.Timestamptz(6)
+  durationSeconds Int?      @map("duration_seconds")
+  failureReason   String?   @map("failure_reason")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([customerId, createdAt])
+  @@index([driverProfileId, createdAt])
+  @@index([bookingId])
+  @@index([providerCallId])
+  @@index([status, createdAt])
+  @@map("call_sessions")
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+
+  @@map("day_of_week")
+}
+
+enum ScheduleExceptionType {
+  OFF
+  CUSTOM_HOURS
+  HOLIDAY
+  LEAVE
+
+  @@map("schedule_exception_type")
+}
+
+/// Driver recurring weekly shift schedule entries.
+model DriverSchedule {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId String        @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  dayOfWeek       DayOfWeek     @map("day_of_week")
+  startTime       String        @map("start_time")
+  endTime         String        @map("end_time")
+  timezone        String        @default("Asia/Kolkata") @map("timezone")
+  isActive        Boolean       @default(true) @map("is_active")
+  isOvernight     Boolean       @default(false) @map("is_overnight")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([driverProfileId, dayOfWeek])
+  @@index([driverProfileId, isActive])
+  @@map("driver_schedules")
+}
+
+/// Driver schedule exceptions (leave, holiday, custom hours override).
+model DriverScheduleException {
+  id              String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId String                @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile         @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  date            DateTime              @map("date") @db.Date
+  exceptionType   ScheduleExceptionType @map("exception_type")
+  startTime       String?               @map("start_time")
+  endTime         String?               @map("end_time")
+  reason          String?               @map("reason")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([driverProfileId, date])
+  @@index([driverProfileId, date])
+  @@map("driver_schedule_exceptions")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 31: Tax Invoices & Customer Favorites
+// ---------------------------------------------------------------------------
+
+enum TaxInvoiceStatus {
+  ISSUED
+  CANCELLED
+  CREDIT_NOTE_ISSUED
+
+  @@map("tax_invoice_status")
+}
+
+/// GST compliant tax invoices for bookings.
+model TaxInvoice {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceNumber    String           @unique @map("invoice_number")
+  customerId       String           @map("customer_id") @db.Uuid
+  customer         User             @relation("CustomerTaxInvoices", fields: [customerId], references: [id], onDelete: Cascade)
+  bookingId        String?          @unique @map("booking_id") @db.Uuid
+  booking          Booking?         @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  paymentId        String?          @map("payment_id") @db.Uuid
+  payment          Payment?         @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  subtotalAmount   Decimal          @map("subtotal_amount") @db.Decimal(10, 2)
+  discountAmount   Decimal          @default(0.00) @map("discount_amount") @db.Decimal(10, 2)
+  taxAmount        Decimal          @map("tax_amount") @db.Decimal(10, 2)
+  totalAmount      Decimal          @map("total_amount") @db.Decimal(10, 2)
+  currency         String           @default("INR")
+  status           TaxInvoiceStatus @default(ISSUED)
+  supplierSnapshot Json             @map("supplier_snapshot")
+  customerSnapshot Json             @map("customer_snapshot")
+  taxDetails       Json?            @map("tax_details")
+  issuedAt         DateTime         @default(now()) @map("issued_at") @db.Timestamptz(6)
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([customerId, createdAt])
+  @@index([status, createdAt])
+  @@map("tax_invoices")
+}
+
+/// Customer favorite drivers mapping.
+model CustomerFavoriteDriver {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId      String        @map("customer_id") @db.Uuid
+  customer        User          @relation("CustomerFavoriteDrivers", fields: [customerId], references: [id], onDelete: Cascade)
+  driverProfileId String        @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile @relation("DriverFavoriteCustomers", fields: [driverProfileId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([customerId, driverProfileId])
+  @@index([customerId, createdAt])
+  @@map("customer_favorite_drivers")
+}
+
+/// Driver Incentive Campaign definition created by admin.
+model DriverIncentiveCampaign {
+  id            String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String
+  description   String?
+  status        IncentiveCampaignStatus @default(DRAFT)
+  incentiveType IncentiveType           @map("incentive_type")
+  targetValue   Decimal                 @map("target_value") @db.Decimal(12, 4)
+  rewardAmount  Decimal                 @map("reward_amount") @db.Decimal(12, 4)
+  startAt       DateTime                @map("start_at") @db.Timestamptz(6)
+  endAt         DateTime                @map("end_at") @db.Timestamptz(6)
+  timezone      String                  @default("Asia/Kolkata")
+  configuration Json?
+  createdAt     DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  progresses DriverIncentiveProgress[]
+
+  @@index([status, startAt, endAt])
+  @@map("driver_incentive_campaigns")
+}
+
+/// Idempotent driver progress & qualification for an incentive campaign.
+model DriverIncentiveProgress {
+  id                     String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  campaignId             String                  @map("campaign_id") @db.Uuid
+  campaign               DriverIncentiveCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  driverProfileId        String                  @map("driver_profile_id") @db.Uuid
+  driverProfile          DriverProfile           @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  status                 IncentiveProgressStatus @default(IN_PROGRESS)
+  currentValue           Decimal                 @default(0.0000) @map("current_value") @db.Decimal(12, 4)
+  targetValue            Decimal                 @map("target_value") @db.Decimal(12, 4)
+  rewardAmount           Decimal                 @map("reward_amount") @db.Decimal(12, 4)
+  qualifiedAt            DateTime?               @map("qualified_at") @db.Timestamptz(6)
+  rewardedAt             DateTime?               @map("rewarded_at") @db.Timestamptz(6)
+  financialTransactionId String?                 @unique @map("financial_transaction_id") @db.Uuid
+  financialTransaction   FinancialTransaction?   @relation(fields: [financialTransactionId], references: [id], onDelete: SetNull)
+  metadata               Json?
+  createdAt              DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([campaignId, driverProfileId])
+  @@index([driverProfileId, status])
+  @@map("driver_incentive_progresses")
+}
+
+/// Driver daily & weekly target preferences for dashboard tracking.
+model DriverGoalPreference {
+  id                 String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId    String        @unique @map("driver_profile_id") @db.Uuid
+  driverProfile      DriverProfile @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  dailyTripGoal      Int           @default(5) @map("daily_trip_goal")
+  weeklyEarningsGoal Decimal       @default(15000.0000) @map("weekly_earnings_goal") @db.Decimal(12, 4)
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("driver_goal_preferences")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 35 — Customer Loyalty, Rewards & Membership Engine
+// ---------------------------------------------------------------------------
+
+enum LoyaltyTransactionType {
+  RIDE_EARNED
+  TIER_BONUS
+  STREAK_BONUS
+  REFERRAL_BONUS
+  PROMOTIONAL_BONUS
+  REWARD_REDEMPTION
+  EXPIRATION
+  REVERSAL
+  ADMIN_ADJUSTMENT
+}
+
+enum LoyaltyTierCode {
+  BRONZE
+  SILVER
+  GOLD
+  PLATINUM
+}
+
+enum LoyaltyRewardType {
+  PROMOTION
+  DISCOUNT
+  FREE_RIDE
+  PRIORITY_BOOKING
+  POINT_MULTIPLIER
+}
+
+enum LoyaltyRewardStatus {
+  ACTIVE
+  PAUSED
+  EXPIRED
+  ARCHIVED
+}
+
+enum LoyaltyRedemptionStatus {
+  COMPLETED
+  REVERSED
+  EXPIRED
+}
+
+/// Server-authoritative customer loyalty account balance & current tier.
+model CustomerLoyaltyAccount {
+  id                     String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId             String       @unique @map("customer_id") @db.Uuid
+  customer               User         @relation("CustomerLoyaltyAccount", fields: [customerId], references: [id], onDelete: Cascade)
+  currentPoints          Int          @default(0) @map("current_points")
+  lifetimeEarnedPoints   Int          @default(0) @map("lifetime_earned_points")
+  lifetimeRedeemedPoints Int          @default(0) @map("lifetime_redeemed_points")
+  currentTierId          String?      @map("current_tier_id") @db.Uuid
+  currentTier            LoyaltyTier? @relation("AccountCurrentTier", fields: [currentTierId], references: [id], onDelete: SetNull)
+  tierUpgradedAt         DateTime?    @map("tier_upgraded_at") @db.Timestamptz(6)
+  version                Int          @default(1)
+  createdAt              DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  transactions LoyaltyPointTransaction[]
+  redemptions  LoyaltyRewardRedemption[]
+
+  @@map("customer_loyalty_accounts")
+}
+
+/// Configurable customer loyalty membership tier definitions.
+model LoyaltyTier {
+  id                    String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                  LoyaltyTierCode @unique
+  name                  String
+  minimumLifetimePoints Int             @default(0) @map("minimum_lifetime_points")
+  minimumCompletedTrips Int             @default(0) @map("minimum_completed_trips")
+  priority              Int             @default(1)
+  pointMultiplier       Decimal         @default(1.00) @map("point_multiplier") @db.Decimal(5, 2)
+  benefits              Json?
+  status                String          @default("ACTIVE")
+  createdAt             DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  accounts CustomerLoyaltyAccount[] @relation("AccountCurrentTier")
+  rewards  LoyaltyReward[]          @relation("TierMinimumRequirement")
+
+  @@map("loyalty_tiers")
+}
+
+/// Immutable ledger of all earned, redeemed, expired, and reversed loyalty points.
+model LoyaltyPointTransaction {
+  id               String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  loyaltyAccountId String                 @map("loyalty_account_id") @db.Uuid
+  loyaltyAccount   CustomerLoyaltyAccount @relation(fields: [loyaltyAccountId], references: [id], onDelete: Cascade)
+  customerId       String                 @map("customer_id") @db.Uuid
+  type             LoyaltyTransactionType
+  points           Int
+  balanceAfter     Int                    @map("balance_after")
+  bookingId        String?                @map("booking_id") @db.Uuid
+  booking          Booking?               @relation("BookingLoyaltyTransactions", fields: [bookingId], references: [id], onDelete: SetNull)
+  rewardId         String?                @map("reward_id") @db.Uuid
+  reward           LoyaltyReward?         @relation(fields: [rewardId], references: [id], onDelete: SetNull)
+  referenceId      String?                @map("reference_id")
+  idempotencyKey   String?                @unique @map("idempotency_key")
+  adminUserId      String?                @map("admin_user_id") @db.Uuid
+  adminUser        User?                  @relation("AdminLoyaltyAdjustments", fields: [adminUserId], references: [id], onDelete: SetNull)
+  description      String
+  expiresAt        DateTime?              @map("expires_at") @db.Timestamptz(6)
+  createdAt        DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([customerId, createdAt])
+  @@index([customerId, type])
+  @@index([customerId, expiresAt])
+  @@index([bookingId])
+  @@map("loyalty_point_transactions")
+}
+
+/// Catalog of rewards redeemable using customer loyalty points.
+model LoyaltyReward {
+  id                   String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  title                String
+  description          String?
+  rewardType           LoyaltyRewardType       @map("reward_type")
+  pointsRequired       Int                     @map("points_required")
+  minimumTierId        String?                 @map("minimum_tier_id") @db.Uuid
+  minimumTier          LoyaltyTier?            @relation("TierMinimumRequirement", fields: [minimumTierId], references: [id], onDelete: SetNull)
+  promotionId          String?                 @map("promotion_id") @db.Uuid
+  promotion            Promotion?              @relation("RewardPromotion", fields: [promotionId], references: [id], onDelete: SetNull)
+  discountValue        Decimal?                @map("discount_value") @db.Decimal(12, 4)
+  status               LoyaltyRewardStatus     @default(ACTIVE)
+  startsAt             DateTime                @default(now()) @map("starts_at") @db.Timestamptz(6)
+  expiresAt            DateTime?               @map("expires_at") @db.Timestamptz(6)
+  totalRedemptionLimit Int?                    @map("total_redemption_limit")
+  totalRedeemedCount   Int                     @default(0) @map("total_redeemed_count")
+  perCustomerLimit     Int                     @default(1) @map("per_customer_limit")
+  createdAt            DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  redemptions  LoyaltyRewardRedemption[]
+  transactions LoyaltyPointTransaction[]
+
+  @@map("loyalty_rewards")
+}
+
+/// Transactional record of redeemed rewards.
+model LoyaltyRewardRedemption {
+  id               String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  loyaltyAccountId String                  @map("loyalty_account_id") @db.Uuid
+  loyaltyAccount   CustomerLoyaltyAccount  @relation(fields: [loyaltyAccountId], references: [id], onDelete: Cascade)
+  customerId       String                  @map("customer_id") @db.Uuid
+  rewardId         String                  @map("reward_id") @db.Uuid
+  reward           LoyaltyReward           @relation(fields: [rewardId], references: [id], onDelete: Restrict)
+  pointsDeducted   Int                     @map("points_deducted")
+  status           LoyaltyRedemptionStatus @default(COMPLETED)
+  idempotencyKey   String?                 @unique @map("idempotency_key")
+  promotionUsageId String?                 @map("promotion_usage_id") @db.Uuid
+  redeemedAt       DateTime                @default(now()) @map("redeemed_at") @db.Timestamptz(6)
+
+  @@index([customerId, redeemedAt])
+  @@index([rewardId, customerId])
+  @@map("loyalty_reward_redemptions")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 36 — Production Scheduled, Recurring & Favorite Driver Booking
+// ---------------------------------------------------------------------------
+
+enum ScheduledRideStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+  EXPIRED
+  FAILED
+}
+
+enum ScheduleType {
+  ONE_TIME
+  RECURRING
+}
+
+enum RecurrenceFrequency {
+  DAILY
+  WEEKLY
+  CUSTOM_DAYS
+}
+
+enum OccurrenceStatus {
+  GENERATED
+  SKIPPED
+  FAILED
+}
+
+/// Customer's one-time or recurring scheduled ride definition.
+model ScheduledRide {
+  id                       String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  idempotencyKey           String?              @unique @map("idempotency_key")
+  customerId               String               @map("customer_id") @db.Uuid
+  customer                 User                 @relation("CustomerScheduledRides", fields: [customerId], references: [id], onDelete: Cascade)
+  status                   ScheduledRideStatus  @default(ACTIVE)
+  scheduleType             ScheduleType         @default(ONE_TIME) @map("schedule_type")
+  bookingType              BookingType          @default(ONE_WAY) @map("booking_type")
+  pickupLatitude           Float                @map("pickup_latitude")
+  pickupLongitude          Float                @map("pickup_longitude")
+  pickupAddress            String               @map("pickup_address")
+  pickupLabel              String?              @map("pickup_label")
+  dropoffLatitude          Float?               @map("dropoff_latitude")
+  dropoffLongitude         Float?               @map("dropoff_longitude")
+  dropoffAddress           String?              @map("dropoff_address")
+  dropoffLabel             String?              @map("dropoff_label")
+  savedLocationId          String?              @map("saved_location_id") @db.Uuid
+  savedLocation            SavedLocation?       @relation("SavedLocationScheduledRides", fields: [savedLocationId], references: [id], onDelete: SetNull)
+  vehicleCategory          String?              @default("SEDAN") @map("vehicle_category")
+  preferredDriverProfileId String?              @map("preferred_driver_profile_id") @db.Uuid
+  preferredDriver          DriverProfile?       @relation("PreferredDriverScheduledRides", fields: [preferredDriverProfileId], references: [id], onDelete: SetNull)
+  promotionCode            String?              @map("promotion_code")
+  scheduledTime            String               @map("scheduled_time")
+  scheduledDate            DateTime?            @map("scheduled_date") @db.Timestamptz(6)
+  recurrenceFrequency      RecurrenceFrequency? @map("recurrence_frequency")
+  daysOfWeek               Int[]                @map("days_of_week")
+  timezone                 String               @default("Asia/Kolkata")
+  startAt                  DateTime             @default(now()) @map("start_at") @db.Timestamptz(6)
+  endAt                    DateTime?            @map("end_at") @db.Timestamptz(6)
+  nextOccurrenceAt         DateTime?            @map("next_occurrence_at") @db.Timestamptz(6)
+  lastGeneratedAt          DateTime?            @map("last_generated_at") @db.Timestamptz(6)
+  failureReason            String?              @map("failure_reason")
+  notes                    String?
+  createdAt                DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
+  cancelledAt              DateTime?            @map("cancelled_at") @db.Timestamptz(6)
+
+  generatedBookings Booking[]                    @relation("GeneratedBookings")
+  occurrences       ScheduledRideOccurrenceLog[]
+
+  @@index([customerId, status])
+  @@index([status, nextOccurrenceAt])
+  @@index([preferredDriverProfileId])
+  @@map("scheduled_rides")
+}
+
+/// Idempotency log for scheduled ride occurrence booking generation.
+model ScheduledRideOccurrenceLog {
+  id                       String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scheduledRideId          String           @map("scheduled_ride_id") @db.Uuid
+  scheduledRide            ScheduledRide    @relation(fields: [scheduledRideId], references: [id], onDelete: Cascade)
+  occurrenceStart          DateTime         @map("occurrence_start") @db.Timestamptz(6)
+  occurrenceIdempotencyKey String           @unique @map("occurrence_idempotency_key")
+  bookingId                String?          @map("booking_id") @db.Uuid
+  booking                  Booking?         @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  status                   OccurrenceStatus @default(GENERATED)
+  failureReason            String?          @map("failure_reason")
+  createdAt                DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([scheduledRideId, occurrenceStart])
+  @@map("scheduled_ride_occurrence_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 38 — Driver Engagement, Gamification, Achievements & Streaks
+// ---------------------------------------------------------------------------
+
+enum AchievementCategory {
+  TRIPS
+  STREAK
+  RATING
+  EARNINGS
+  SCHEDULE
+  COMPLIANCE
+  GOAL
+  CUSTOM
+}
+
+enum StreakStatus {
+  ACTIVE
+  BROKEN
+  PROTECTED
+}
+
+/// Admin-configurable driver achievement catalog definition.
+model DriverAchievementDefinition {
+  id            String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code          String              @unique
+  name          String
+  description   String?
+  category      AchievementCategory @default(TRIPS)
+  targetValue   Decimal             @default(1.0000) @map("target_value") @db.Decimal(12, 4)
+  badgeIcon     String              @default("emoji_events") @map("badge_icon")
+  displayOrder  Int                 @default(0) @map("display_order")
+  isActive      Boolean             @default(true) @map("is_active")
+  startsAt      DateTime?           @map("starts_at") @db.Timestamptz(6)
+  endsAt        DateTime?           @map("ends_at") @db.Timestamptz(6)
+  criteriaConfig Json?               @map("criteria_config")
+  rewardConfig   Json?               @map("reward_config")
+  createdAt     DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  progresses DriverAchievementProgress[]
+  unlocks    DriverAchievementUnlock[]
+
+  @@index([isActive, category, displayOrder])
+  @@map("driver_achievement_definitions")
+}
+
+/// Idempotent progress tracking for driver achievement criteria.
+model DriverAchievementProgress {
+  id                      String                      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId         String                      @map("driver_profile_id") @db.Uuid
+  driverProfile           DriverProfile               @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  achievementDefinitionId String                      @map("achievement_definition_id") @db.Uuid
+  achievementDefinition   DriverAchievementDefinition @relation(fields: [achievementDefinitionId], references: [id], onDelete: Cascade)
+  currentValue            Decimal                     @default(0.0000) @map("current_value") @db.Decimal(12, 4)
+  targetValue             Decimal                     @map("target_value") @db.Decimal(12, 4)
+  isCompleted             Boolean                     @default(false) @map("is_completed")
+  completedAt             DateTime?                   @map("completed_at") @db.Timestamptz(6)
+  lastEvaluatedAt         DateTime                    @default(now()) @map("last_evaluated_at") @db.Timestamptz(6)
+  createdAt               DateTime                    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime                    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([driverProfileId, achievementDefinitionId])
+  @@index([driverProfileId, isCompleted])
+  @@map("driver_achievement_progresses")
+}
+
+/// Immutable record of unlocked driver achievements.
+model DriverAchievementUnlock {
+  id                      String                      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId         String                      @map("driver_profile_id") @db.Uuid
+  driverProfile           DriverProfile               @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  achievementDefinitionId String                      @map("achievement_definition_id") @db.Uuid
+  achievementDefinition   DriverAchievementDefinition @relation(fields: [achievementDefinitionId], references: [id], onDelete: Cascade)
+  unlockedAt              DateTime                    @default(now()) @map("unlocked_at") @db.Timestamptz(6)
+  idempotencyKey          String?                     @unique @map("idempotency_key")
+  triggerReferenceId      String?                     @map("trigger_reference_id")
+  metadata                Json?
+  createdAt               DateTime                    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([driverProfileId, achievementDefinitionId])
+  @@index([driverProfileId, unlockedAt])
+  @@map("driver_achievement_unlocks")
+}
+
+/// Driver daily activity streak projection in Asia/Kolkata business timezone.
+model DriverStreak {
+  id                 String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  driverProfileId    String       @unique @map("driver_profile_id") @db.Uuid
+  driverProfile      DriverProfile @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+  currentStreak      Int          @default(0) @map("current_streak")
+  longestStreak      Int          @default(0) @map("longest_streak")
+  lastQualifyingDate DateTime?    @map("last_qualifying_date") @db.Date
+  streakStatus       StreakStatus @default(ACTIVE) @map("streak_status")
+  updatedAt          DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("driver_streaks")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 41: Production Corporate / Business Accounts & Fleet Management
+// ---------------------------------------------------------------------------
+
+enum OrganizationStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum OrganizationMemberRole {
+  OWNER
+  ADMIN
+  TRAVEL_MANAGER
+  APPROVER
+  FINANCE
+  MEMBER
+}
+
+enum OrganizationMemberStatus {
+  INVITED
+  ACTIVE
+  DEACTIVATED
+}
+
+enum PolicyStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
+
+/// Corporate / Business organization entity.
+model Organization {
+  id             String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String
+  slug           String             @unique
+  legalName      String?            @map("legal_name")
+  gstin          String?
+  pan            String?
+  billingEmail   String             @map("billing_email")
+  billingPhone   String?            @map("billing_phone")
+  domain         String?
+  status         OrganizationStatus @default(ACTIVE)
+  creditLimit    Decimal            @default(0.0000) @map("credit_limit") @db.Decimal(12, 4)
+  currentBalance Decimal            @default(0.0000) @map("current_balance") @db.Decimal(12, 4)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  members          OrganizationMember[]
+  departments      OrganizationDepartment[]
+  costCenters      OrganizationCostCenter[]
+  travelPolicies   OrganizationTravelPolicy[]
+  approvalRequests CorporateApprovalRequest[]
+  bookings         Booking[]                  @relation("OrganizationBookings")
+  billingProfile   CorporateBillingProfile?
+  invitations      OrganizationInvitation[]
+
+  @@map("organizations")
+}
+
+/// Membership binding a User identity to an Organization with role and department/cost-center.
+model OrganizationMember {
+  id             String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String                   @map("organization_id") @db.Uuid
+  organization   Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String                   @map("user_id") @db.Uuid
+  user           User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           OrganizationMemberRole   @default(MEMBER)
+  status         OrganizationMemberStatus @default(ACTIVE)
+  employeeCode   String?                  @map("employee_code")
+  designation    String?
+
+  departmentId   String?                  @map("department_id") @db.Uuid
+  department     OrganizationDepartment?  @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  costCenterId   String?                  @map("cost_center_id") @db.Uuid
+  costCenter     OrganizationCostCenter?  @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+
+  joinedAt  DateTime? @map("joined_at") @db.Timestamptz(6)
+  removedAt DateTime? @map("removed_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([organizationId, userId])
+  @@index([userId, status])
+  @@index([organizationId, role])
+  @@map("organization_members")
+}
+
+/// Department structure within an Organization.
+model OrganizationDepartment {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  code           String
+  name           String
+  description    String?
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  members  OrganizationMember[]
+  bookings Booking[]
+
+  @@unique([organizationId, code])
+  @@map("organization_departments")
+}
+
+/// Cost Center allocation within an Organization.
+model OrganizationCostCenter {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  code           String
+  name           String
+  description    String?
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  members  OrganizationMember[]
+  bookings Booking[]
+
+  @@unique([organizationId, code])
+  @@map("organization_cost_centers")
+}
+
+/// Travel policy defining fare, distance, vehicle categories, and approval constraints.
+model OrganizationTravelPolicy {
+  id                         String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId             String       @map("organization_id") @db.Uuid
+  organization               Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name                       String
+  description                String?
+  isDefault                  Boolean      @default(false) @map("is_default")
+  maxFareAmount              Decimal?     @map("max_fare_amount") @db.Decimal(12, 4)
+  maxDistanceKm              Float?       @map("max_distance_km")
+  allowedVehicleCategories   Json?        @map("allowed_vehicle_categories") @db.JsonB
+  requireApprovalAboveAmount Decimal?     @map("require_approval_above_amount") @db.Decimal(12, 4)
+  requireApprovalAllRides    Boolean      @default(false) @map("require_approval_all_rides")
+  allowAdvanceBookingHours   Int?         @map("allow_advance_booking_hours")
+  allowedBookingDays         Json?        @map("allowed_booking_days") @db.JsonB
+  monthlyEmployeeSpendLimit  Decimal?     @map("monthly_employee_spend_limit") @db.Decimal(12, 4)
+  status                     PolicyStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([organizationId, status])
+  @@map("organization_travel_policies")
+}
+
+/// Concurrency-safe corporate travel approval request.
+model CorporateApprovalRequest {
+  id                String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String         @map("organization_id") @db.Uuid
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  requesterUserId   String         @map("requester_user_id") @db.Uuid
+  requesterUser     User           @relation("RequesterUsers", fields: [requesterUserId], references: [id], onDelete: Cascade)
+  approverUserId    String?        @map("approver_user_id") @db.Uuid
+  approverUser      User?          @relation("ApproverUsers", fields: [approverUserId], references: [id], onDelete: SetNull)
+  status            ApprovalStatus @default(PENDING)
+  bookingParameters Json           @map("booking_parameters") @db.JsonB
+  policyViolations  Json?          @map("policy_violations") @db.JsonB
+  reason            String?
+  reviewComment     String?        @map("review_comment")
+  requestedAt       DateTime       @default(now()) @map("requested_at") @db.Timestamptz(6)
+  reviewedAt        DateTime?      @map("reviewed_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  bookings Booking[]
+
+  @@index([organizationId, status, requestedAt])
+  @@index([requesterUserId, status])
+  @@map("corporate_approval_requests")
+}
+
+/// Corporate billing configuration and tax profile.
+model CorporateBillingProfile {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String       @unique @map("organization_id") @db.Uuid
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  legalName      String       @map("legal_name")
+  billingAddress String       @map("billing_address")
+  gstin          String?
+  billingEmail   String       @map("billing_email")
+  paymentTermDays Int         @default(30) @map("payment_term_days")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("corporate_billing_profiles")
+}
+
+/// Invitation record storing hashed token for secure employee onboarding.
+model OrganizationInvitation {
+  id             String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String                 @map("organization_id") @db.Uuid
+  organization   Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email          String
+  invitedByUserId String                @map("invited_by_user_id") @db.Uuid
+  invitedByUser   User                  @relation("InvitedByUsers", fields: [invitedByUserId], references: [id], onDelete: Cascade)
+  role           OrganizationMemberRole @default(MEMBER)
+  tokenHash      String                 @unique @map("token_hash")
+  status         InvitationStatus       @default(PENDING)
+  expiresAt      DateTime               @map("expires_at") @db.Timestamptz(6)
+  acceptedAt     DateTime?              @map("accepted_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([organizationId, status])
+  @@map("organization_invitations")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 42: Production Marketplace Intelligence, Demand Forecasting & Signals
+// ---------------------------------------------------------------------------
+
+enum MarketplaceZoneStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum RecommendationActionType {
+  ACKNOWLEDGED
+  DISMISSED
+}
+
+/// Server-authoritative geographic zone definition for demand/supply intelligence.
+model MarketplaceZone {
+  id              String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code            String                @unique
+  name            String
+  description     String?
+  centerLatitude  Float                 @map("center_latitude")
+  centerLongitude Float                 @map("center_longitude")
+  radiusMeters    Int                   @default(5000) @map("radius_meters")
+  status          MarketplaceZoneStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([status])
+  @@map("marketplace_zones")
+}
+
+/// Action audit log for admin interaction with operational recommendations.
+model MarketplaceRecommendationAction {
+  id                        String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  recommendationFingerprint String                   @map("recommendation_fingerprint")
+  action                    RecommendationActionType
+  adminUserId               String                   @map("admin_user_id") @db.Uuid
+  adminUser                 User                     @relation("AdminRecommendationActions", fields: [adminUserId], references: [id], onDelete: Restrict)
+  notes                     String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([recommendationFingerprint, action])
+  @@index([adminUserId])
+  @@map("marketplace_recommendation_actions")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 44: Production AI Concierge, Smart Booking Assistant & Driver Copilot
+// ---------------------------------------------------------------------------
+
+enum AIConversationRole {
+  CUSTOMER
+  DRIVER
+
+  @@map("ai_conversation_role")
+}
+
+enum AIConversationStatus {
+  ACTIVE
+  ARCHIVED
+
+  @@map("ai_conversation_status")
+}
+
+enum AIMessageSender {
+  USER
+  ASSISTANT
+  SYSTEM
+
+  @@map("ai_message_sender")
+}
+
+/// AI conversation session model per user.
+model AIConversation {
+  id        String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String               @map("user_id") @db.Uuid
+  user      User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      AIConversationRole   @default(CUSTOMER)
+  title     String?
+  status    AIConversationStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  messages AIMessage[]
+
+  @@index([userId, role, status])
+  @@index([createdAt])
+  @@map("ai_conversations")
+}
+
+/// Message history entry within an AI conversation.
+model AIMessage {
+  id             String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversationId String          @map("conversation_id") @db.Uuid
+  conversation   AIConversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         AIMessageSender
+  content        String
+  intent         String?
+  actions        Json?
+  citations      Json?
+  metadata       Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([conversationId, createdAt])
+  @@map("ai_messages")
+}
+
+/// Telemetry and observability audit record for AI model requests.
+model AIAuditLog {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role         String
+  intent       String
+  provider     String
+  model        String
+  latencyMs    Int      @map("latency_ms")
+  success      Boolean  @default(true)
+  actionType   String?  @map("action_type")
+  tokenUsage   Json?    @map("token_usage")
+  errorMessage String?  @map("error_message")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([userId, createdAt])
+  @@index([intent])
+  @@index([success])
+  @@map("ai_audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 45: Production Smart Trip Intelligence, Real-Time Trip Assistant
+// ---------------------------------------------------------------------------
+
+/// Persistent operational intelligence event record for trip signal tracking and deduplication.
+model TripIntelligenceEvent {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId  String   @map("booking_id") @db.Uuid
+  booking    Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  userId     String   @map("user_id") @db.Uuid
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  actorRole  String   @map("actor_role")
+  signalType String   @map("signal_type")
+  confidence String   @default("HIGH")
+  fingerprint String  @unique
+  metadata   Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([bookingId, createdAt])
+  @@index([userId, actorRole])
+  @@index([signalType])
+  @@map("trip_intelligence_events")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 46: Production Smart Trip Reliability & Incident Recovery Engine
+// ---------------------------------------------------------------------------
+
+enum TripReliabilityIncidentType {
+  ASSIGNMENT_TIMEOUT
+  DISPATCH_FAILURE
+  NO_DRIVER_AVAILABLE
+  DRIVER_LOCATION_STALE
+  DRIVER_NOT_MOVING
+  PICKUP_DELAY
+  CUSTOMER_UNREACHABLE
+  DRIVER_CANCELLED
+  TRIP_STUCK
+  SCHEDULED_RIDE_FAILURE
+  PAYMENT_RECONCILIATION
+  INVOICE_FAILURE
+  NOTIFICATION_FAILURE
+  SAFETY_ESCALATION
+  SUPPORT_ESCALATION
+
+  @@map("trip_reliability_incident_type")
+}
+
+enum TripReliabilityIncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+
+  @@map("trip_reliability_incident_severity")
+}
+
+enum TripReliabilityIncidentStatus {
+  DETECTED
+  INVESTIGATING
+  CONFIRMED
+  RECOVERY_PENDING
+  RECOVERING
+  RESOLVED
+  ESCALATED
+  CLOSED
+  DISMISSED
+
+  @@map("trip_reliability_incident_status")
+}
+
+enum TripReliabilityConfidence {
+  HIGH
+  MEDIUM
+  LOW
+
+  @@map("trip_reliability_confidence")
+}
+
+/// Operational trip reliability incident record for tracking lifecycle anomalies and automated recovery.
+model TripReliabilityIncident {
+  id              String                          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  incidentNumber  String                          @unique @map("incident_number")
+  bookingId       String                          @map("booking_id") @db.Uuid
+  booking         Booking                         @relation("BookingReliabilityIncidents", fields: [bookingId], references: [id], onDelete: Cascade)
+  customerId      String?                         @map("customer_id") @db.Uuid
+  customer        User?                           @relation("CustomerReliabilityIncidents", fields: [customerId], references: [id], onDelete: SetNull)
+  driverProfileId String?                         @map("driver_profile_id") @db.Uuid
+  driverProfile   DriverProfile?                  @relation("DriverReliabilityIncidents", fields: [driverProfileId], references: [id], onDelete: SetNull)
+  type            TripReliabilityIncidentType
+  severity        TripReliabilityIncidentSeverity @default(MEDIUM)
+  status          TripReliabilityIncidentStatus   @default(DETECTED)
+  confidence      TripReliabilityConfidence       @default(HIGH)
+  fingerprint     String                          @unique
+  metadata        Json?
+  resolutionCode  String?                         @map("resolution_code")
+  
+  detectedAt  DateTime  @default(now()) @map("detected_at") @db.Timestamptz(6)
+  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz(6)
+  resolvedAt  DateTime? @map("resolved_at") @db.Timestamptz(6)
+  escalatedAt DateTime? @map("escalated_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  timelineEntries TripReliabilityTimeline[]
+
+  @@index([bookingId, status])
+  @@index([customerId])
+  @@index([driverProfileId])
+  @@index([type, status])
+  @@index([severity, status])
+  @@index([createdAt])
+  @@map("trip_reliability_incidents")
+}
+
+/// Immutable timeline entry recording every status transition, action, and recovery attempt for a trip reliability incident.
+model TripReliabilityTimeline {
+  id          String                         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  incidentId  String                         @map("incident_id") @db.Uuid
+  incident    TripReliabilityIncident        @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  fromStatus  TripReliabilityIncidentStatus? @map("from_status")
+  toStatus    TripReliabilityIncidentStatus? @map("to_status")
+  action      String
+  actorUserId String?                        @map("actor_user_id") @db.Uuid
+  actorRole   String                         @map("actor_role")
+  notes       String?
+  createdAt   DateTime                       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([incidentId, createdAt])
+  @@map("trip_reliability_timelines")
+}
+
+
+
+
+
